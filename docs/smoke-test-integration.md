@@ -81,9 +81,18 @@ Maestro 本身是个 CLI，直接通过 adb 跟设备通信，根本不需要 ph
 | POST | `/api/v1/devices/acquire` | 租用单台设备（`any`/`serial` + TTL；并释放其 scrcpy 控制权） | ✅ |
 | POST | `/api/v1/devices/release` | 按 `task_id` 归还租约 | ✅ 骨架 |
 | POST | `/api/v1/install` | `adb install -r`（复用共享逻辑） | ✅ 骨架 |
-| POST | `/api/v1/capture/start` | 起 screenrecord + logcat | ⏳ Phase 2（stub 501） |
-| POST | `/api/v1/capture/stop` | 收尾产物 | ⏳ Phase 2（stub 501） |
+| POST | `/api/v1/capture/start` | 起 scrcpy 视频流录屏 → `.mp4`（decision #2） | ✅ |
+| POST | `/api/v1/capture/stop` | 停录并 finalize fast-start mp4，返回路径 + 帧数 | ✅ |
 | GET | `/api/v1/smoke/report` | JUnit/JSON 产物包 | ⏳ Phase 2（stub 501） |
+
+录屏 curl（接在装包之后、maestro 之前起，测完停）：
+```bash
+curl -s "${H[@]}" -d '{"task_id":"build-1234"}' localhost:9090/api/v1/capture/start
+# → {"task_id":"build-1234","serial":"emulator-5554","output":"~/.phone_control/recordings/build-1234-emulator-5554-<ts>.mp4"}
+# ... maestro test --device emulator-5554 ... ...
+curl -s "${H[@]}" -d '{"task_id":"build-1234"}' localhost:9090/api/v1/capture/stop
+# → {"serial":"emulator-5554","output":"...mp4","frames":1234}
+```
 
 **鉴权**：除 `/health` 外，所有端点要求 `Authorization: Bearer <token>`。token 来自 `PHONE_CONTROL_TOKEN` 环境变量，或落盘在 `~/.phone_control/api_token`（App 首次启动自动生成 UUID）。API 仅绑定 `127.0.0.1`，绝不绑 `0.0.0.0`。
 
@@ -174,7 +183,7 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
 > ⚠️ 现实修正：原方案把「API 化 + iOS 冒烟」都压进 1~2 周。**iOS 是独立大头**（另一套 tidevice/simctl 工具链），Phase 1 只做 Android，iOS 单独排期。
 
 ### Phase 2 — 采集与产物聚合
-- [ ] **录屏（决策 #2）：scrcpy 纯视频流（video-only）→ Pure Rust muxer 落盘 `.mp4`**
+- [x] **录屏（决策 #2）：scrcpy 视频流 → `muxide` 落盘 `.mp4`** —— 已实现并真机验证（emulator：h264 404×720 64 帧 fast-start mp4，ffprobe 通过）。`capture/start|stop` 已上线；录制器 mid-stream 注册时从接收循环取 SPS/PPS。
   - 租约模式下 phone-control 断开 control socket、以 `control=false` 重连拿视频流
   - 侧读 H.264 NAL → **Pure Rust muxer（`muxide` 或 `mp4e`）** 写盘
   - **muxer 选型：坚决用 Pure Rust，放弃 FFmpeg**

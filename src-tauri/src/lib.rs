@@ -1,6 +1,7 @@
 pub mod adb;
 mod config;
 mod control_api;
+mod recording;
 mod state;
 mod ws;
 
@@ -1000,6 +1001,7 @@ pub fn run() {
         .plugin(tauri_plugin_cli::init())
         .manage(app_state)
         .manage(ws_hub)
+        .manage(recording::new_recorders())
         .invoke_handler(tauri::generate_handler![
             add_server,
             remove_server,
@@ -1074,12 +1076,15 @@ pub fn run() {
                 "[CTRL-API] bearer token at {} (or set PHONE_CONTROL_TOKEN)",
                 control_api::token_file_display()
             );
+            let recorders = app.state::<recording::Recorders>().inner().clone();
             let control_state = control_api::ControlApiState::new(
                 Arc::clone(&state.servers),
                 Arc::clone(&state.adb_semaphore),
                 state.stream_tokens.clone(),
                 state.control_sockets.clone(),
                 api_token,
+                recorders,
+                app_handle.clone(),
             );
             tauri::async_runtime::spawn(async move {
                 let _ =

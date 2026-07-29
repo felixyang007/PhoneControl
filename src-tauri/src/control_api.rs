@@ -40,7 +40,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tauri::AppHandle;
 use tokio::sync::{Mutex, Semaphore};
+
+use crate::adb::stream::{start_stream_loop, StreamOptions};
+use crate::recording::Recorder;
 
 /// Default lease lifetime (15 min). A crashed/killed CI job that never calls
 /// `/release` has its lease reclaimed by the background sweeper after this.
@@ -113,6 +117,10 @@ pub struct ControlApiState {
     pub leases: Arc<StdMutex<HashMap<String, Lease>>>,
     /// Bearer token required on every endpoint except `/health`.
     pub token: String,
+    /// Active recordings, keyed by serial (shared with the scrcpy receive loop).
+    pub recorders: crate::recording::Recorders,
+    /// Needed to (re)start a video-only stream to feed the recorder.
+    pub app: AppHandle,
 }
 
 impl ControlApiState {
@@ -122,6 +130,8 @@ impl ControlApiState {
         stream_tokens: StreamTokens,
         control_sockets: ControlSockets,
         token: String,
+        recorders: crate::recording::Recorders,
+        app: AppHandle,
     ) -> Self {
         Self {
             servers,
@@ -130,6 +140,8 @@ impl ControlApiState {
             control_sockets,
             leases: Arc::new(StdMutex::new(HashMap::new())),
             token,
+            recorders,
+            app,
         }
     }
 }
@@ -406,23 +418,171 @@ async fn install(
     ))
 }
 
-// ── Phase 2 stubs (not implemented yet) ───────────────────────────────────────
+// ── Capture (screen recording, decision #2) ───────────────────────────────────
 
-fn not_implemented(what: &str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": format!("{what} — Phase 2, not implemented yet") })),
+/// Resolve host/port for a serial: prefer its lease, else look it up live.
+async fn resolve_endpoint(st: &ControlApiState, serial: &str) -> Option<(String, u16)> {
+    if let Some(l) = st.leases.lock().unwrap().get(serial) {
+        return Some((l.server_host.clone(), l.server_port));
+    }
+    online_devices(&st.servers)
+        .await
+        .into_iter()
+        .find(|d| d.serial == serial)
+        .map(|d| (d.server_host, d.server_port))
+}
+
+fn recordings_dir() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".phone_control");
+    p.push("recordings");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+/// Synthetic stream client id for a recording, so start/stop pair up cleanly.
+fn rec_client_id(serial: &str) -> String {
+    format!("recorder:{serial}")
+}
+
+#[derive(Deserialize)]
+struct CaptureStartReq {
+    /// Record the device leased to this task…
+    #[serde(default)]
+    task_id: Option<String>,
+    /// …or this explicit serial (takes precedence).
+    #[serde(default)]
+    serial: Option<String>,
+    /// Directory for the mp4 (default `~/.phone_control/recordings`).
+    #[serde(default)]
+    output_dir: Option<String>,
+}
+
+async fn capture_start(
+    State(st): State<ControlApiState>,
+    Json(req): Json<CaptureStartReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Resolve the target serial: explicit, else the task's leased device.
+    let serial = match req.serial {
+        Some(s) => s,
+        None => {
+            let task = req
+                .task_id
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "serial or task_id required".into()))?;
+            st.leases
+                .lock()
+                .unwrap()
+                .values()
+                .find(|l| &l.task_id == task)
+                .map(|l| l.serial.clone())
+                .ok_or((StatusCode::BAD_REQUEST, format!("no device leased to {task}")))?
+        }
+    };
+
+    let (host, port) = resolve_endpoint(&st, &serial)
+        .await
+        .ok_or((StatusCode::CONFLICT, format!("device {serial} not online")))?;
+
+    let task_id = req.task_id.clone().unwrap_or_else(|| "adhoc".to_string());
+
+    // Output path: <dir>/<task>-<serial>-<epoch>.mp4 (serial sanitised).
+    let dir = req.output_dir.map(PathBuf::from).unwrap_or_else(recordings_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let safe_serial = serial.replace([':', '/'], "_");
+    let path = dir
+        .join(format!("{task_id}-{safe_serial}-{}.mp4", now_secs()))
+        .display()
+        .to_string();
+
+    // Register the recorder. One per serial.
+    {
+        let mut map = st.recorders.lock().unwrap();
+        if map.contains_key(&serial) {
+            return Err((StatusCode::CONFLICT, format!("already recording {serial}")));
+        }
+        map.insert(serial.clone(), Recorder::new(path.clone(), task_id.clone()));
+    }
+
+    // (Re)start a video-only stream so frames flow to the recorder tap.
+    tauri::async_runtime::spawn(start_stream_loop(
+        Arc::clone(&st.stream_tokens),
+        Arc::clone(&st.control_sockets),
+        Arc::clone(&st.adb_semaphore),
+        serial.clone(),
+        host,
+        port,
+        StreamOptions::default(),
+        rec_client_id(&serial),
+        st.app.clone(),
+    ));
+
+    println!("[CTRL-API] capture start serial={serial} task={task_id} → {path}");
+    Ok(Json(json!({ "task_id": task_id, "serial": serial, "output": path })))
+}
+
+#[derive(Deserialize)]
+struct CaptureStopReq {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    serial: Option<String>,
+}
+
+async fn capture_stop(
+    State(st): State<ControlApiState>,
+    Json(req): Json<CaptureStopReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let serial = match req.serial {
+        Some(s) => s,
+        None => {
+            let task = req
+                .task_id
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "serial or task_id required".into()))?;
+            st.recorders
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, r)| &r.task_id == task)
+                .map(|(s, _)| s.clone())
+                .ok_or((StatusCode::NOT_FOUND, format!("no recording for task {task}")))?
+        }
+    };
+
+    // Remove the recorder so the tap stops feeding it, then finalise the mp4.
+    let recorder = st
+        .recorders
+        .lock()
+        .unwrap()
+        .remove(&serial)
+        .ok_or((StatusCode::NOT_FOUND, format!("no recording for {serial}")))?;
+
+    // Stop the video-only stream we started for recording.
+    stop_stream_loop(
+        Arc::clone(&st.stream_tokens),
+        Arc::clone(&st.control_sockets),
+        &serial,
+        None,
+        None,
+        Some(&rec_client_id(&serial)),
+        true,
     )
+    .await;
+
+    let (path, frames) = recorder
+        .finish()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    println!("[CTRL-API] capture stop serial={serial} frames={frames} → {path}");
+    Ok(Json(json!({ "serial": serial, "output": path, "frames": frames })))
 }
 
-async fn capture_start() -> (StatusCode, Json<Value>) {
-    not_implemented("capture/start (adb screenrecord + logcat to output-dir)")
-}
-
-async fn capture_stop() -> (StatusCode, Json<Value>) {
-    not_implemented("capture/stop (finalize mp4/log artifacts)")
-}
+// ── Phase 2 stub ──────────────────────────────────────────────────────────────
 
 async fn report(Query(_q): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
-    not_implemented("smoke/report (JUnit XML + JSON artifact bundle)")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({ "error": "smoke/report (JUnit XML + JSON artifact bundle) — Phase 2, not implemented yet" })),
+    )
 }

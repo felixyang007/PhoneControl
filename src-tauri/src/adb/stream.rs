@@ -728,6 +728,24 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
 
             let nal_data = &buf[12..12 + packet_size];
 
+            // Recording tap: if a recorder is registered for this serial, mux
+            // this packet to mp4 (decision #2). Independent of the WS broadcast.
+            if let Some(recorders) = app.try_state::<crate::recording::Recorders>() {
+                if let Ok(mut map) = recorders.lock() {
+                    if let Some(rec) = map.get_mut(serial) {
+                        rec.feed(
+                            is_config,
+                            is_key,
+                            pts,
+                            video_width,
+                            video_height,
+                            nal_data,
+                            last_config.as_deref(),
+                        );
+                    }
+                }
+            }
+
             if is_config {
                 // Config packet — cache and forward as type 0
                 last_config = Some(nal_data.to_vec());
