@@ -58,3 +58,13 @@ The single JSON the AI-triage step reads; every path it needs is in here.
 ```
 Logcat is closed with SIGTERM (not SIGKILL), so the last flushed lines — often the
 crash stacktrace — are preserved.
+
+## Phase 3 — 生产接入（AI 归因 → Linear）
+
+`--triage`（只分析、dry-run）在 CI 上只需 `claude` CLI。`--triage-create`（自动建 Linear 单）额外需要在 **CI runner** 上配好：
+
+1. **Linear MCP**：`claude mcp add --transport sse linear https://mcp.linear.app/sse`，并**预先完成 OAuth 授权**（headless `claude -p` 不会弹交互授权）。无法交互授权的环境改用带 `LINEAR_API_KEY` 的 Linear MCP。
+2. **headless 权限**：`claude -p` 拿不到人工批准，需为该运行放行 Linear MCP 工具（权限模式 / 工具 allowlist）。仅放行建单所需工具，别全放开。
+3. **目标 team / label**：按你们 Linear 规范定死（改 `triage-prompt.md` 的 ACTION，或给 `smoke-triage.sh` 传 team/label）。当前演示用的是 `For self-testing` team、无 label——生产务必改。
+
+安全边界：只有 **[A] 崩溃** 才建单（[B]/[C] 只出分析），避免环境抖动/用例失效刷单。`smoke-triage.sh` 默认 dry-run，`--create` 才写 Linear。
