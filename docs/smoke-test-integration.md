@@ -3,6 +3,29 @@
 > 目标：提测/打包完成后，CI 自动调起冒烟测试，10 分钟内验证 App 核心功能是否可用。
 > 本文定义 phone-control 在这条流水线里承担的职责、需要做的改造，以及分阶段落地计划。
 
+## 总览（当前链路）
+
+职责切分：**phone-control** 管设备调度 + 装包 + 采集；**Maestro** 独占驱动 UI（决策 #3）；AI/Linear/飞书属编排层，不进 App。`smoke-tests/smoke-run.sh` 是把它们串起来的 CI 胶水。
+
+```mermaid
+flowchart TD
+    A(["Android APK 打包完成"]) --> B["Jenkins Job · Mac mini Agent<br/>自动登录 + LaunchAgent"]
+    B -->|"smoke-run.sh · curl + Bearer"| C{{"phone-control 控制 API<br/>127.0.0.1:9090 · headless/tray"}}
+
+    C -->|"1· POST /devices/acquire"| D["租 1 台设备 (any / serial)<br/>15min TTL · 释放 scrcpy 控制权 #3"]
+    D -->|"2· POST /install (可选)"| E["adb install -r<br/>host 侧 · 信号量限流"]
+    E -->|"3· POST /capture/start"| F["录屏 scrcpy H.264 → muxide mp4<br/>+ logcat (清缓冲后 threadtime 落盘)"]
+    F --> G[["4· maestro test --device serial<br/>Jenkins 驱动 UI · 退出码 = 成败"]]
+    G -->|"5· POST /capture/stop"| H["finalize fast-start mp4 + kill logcat"]
+    H -->|"6· GET /smoke/report"| I["产物清单 (mp4 + logcat + 帧数)<br/>+ 写 task-manifest.json"]
+    I -->|"7· POST /devices/release"| J(["归还租约 · sweeper 到期兜底"])
+
+    I -. "编排层 · 未接进 App" .-> K["AI 归因 → Linear 建单 → 飞书/钉钉"]
+    G -. "录屏/日志为旁路采集<br/>与 Maestro 输入互不干扰" .-> F
+```
+
+真机实测（emulator）：整链 `maestro exit=0`，产出 562 帧 fast-start mp4 + 6780 行 logcat + manifest。逐步细节见 §3 API 规格与 [`smoke-tests/`](../smoke-tests/)。
+
 ## 0. 一个关键事实纠正
 
 原方案把 phone-control 描述为 **Electron / Native**，并据此建议「用 Node.js/Golang 做 CLI 包装」。
