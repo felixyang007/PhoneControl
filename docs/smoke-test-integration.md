@@ -78,40 +78,47 @@ Maestro 本身是个 CLI，直接通过 adb 跟设备通信，根本不需要 ph
 |---|---|---|---|
 | GET | `/api/v1/health` | 健康检查 | ✅ 骨架 |
 | GET | `/api/v1/devices` | 在线设备 + 租约归属 | ✅ 骨架 |
-| POST | `/api/v1/devices/acquire` | 租用空闲设备（并释放其 scrcpy 控制权） | ✅ 骨架 |
+| POST | `/api/v1/devices/acquire` | 租用单台设备（`any`/`serial` + TTL；并释放其 scrcpy 控制权） | ✅ |
 | POST | `/api/v1/devices/release` | 按 `task_id` 归还租约 | ✅ 骨架 |
 | POST | `/api/v1/install` | `adb install -r`（复用共享逻辑） | ✅ 骨架 |
 | POST | `/api/v1/capture/start` | 起 screenrecord + logcat | ⏳ Phase 2（stub 501） |
 | POST | `/api/v1/capture/stop` | 收尾产物 | ⏳ Phase 2（stub 501） |
 | GET | `/api/v1/smoke/report` | JUnit/JSON 产物包 | ⏳ Phase 2（stub 501） |
 
+**鉴权**：除 `/health` 外，所有端点要求 `Authorization: Bearer <token>`。token 来自 `PHONE_CONTROL_TOKEN` 环境变量，或落盘在 `~/.phone_control/api_token`（App 首次启动自动生成 UUID）。API 仅绑定 `127.0.0.1`，绝不绑 `0.0.0.0`。
+
 示例：
 
 ```bash
-# 1) 租一台空闲设备给本次任务
+TOKEN=$(cat ~/.phone_control/api_token)
+
+# 1) 租一台设备。any（默认）：任意空闲 Android 设备；或精确 serial。
+#    一次一台；并行 Job 各自调一次 /acquire（无多设备组绑定）。
 curl -s localhost:9090/api/v1/devices/acquire \
-  -H 'content-type: application/json' \
-  -d '{"task_id":"build-1234","count":1}'
-# → {"task_id":"build-1234","devices":[{"serial":"emulator-5554",...}]}
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"task_id":"build-1234"}'                       # any
+# -d '{"task_id":"build-1234","serial":"emulator-5554","ttl_secs":900}'  # 精确 + 自定义 TTL
+# → {"task_id":"build-1234","device":{"serial":"emulator-5554",...,"expires_at":1735689600}}
 
 # 2) 装包到该任务租用的设备
 curl -s localhost:9090/api/v1/install \
-  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"task_id":"build-1234","apk_path":"/path/to/app-debug.apk"}'
 
 # 3) Jenkins 自己驱动 UI（phone-control 已让出该设备）
 maestro test --device emulator-5554 ./smoke-tests/
 
-# 4) 归还
+# 4) 归还（即使漏调，租约到期后也会被后台 sweeper 自动回收）
 curl -s localhost:9090/api/v1/devices/release \
-  -H 'content-type: application/json' -d '{"task_id":"build-1234"}'
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"task_id":"build-1234"}'
 ```
 
 ## 4. 部署拓扑（Jenkins Agent on Mac）
 
 - Mac mini / Mac Studio 装 phone-control，作为 Jenkins **Dedicated Agent**。
 - Agent 必须以 **GUI 用户自动登录（Auto-login）+ LaunchAgent** 启动，**不能**用 LaunchDaemon 后台服务 —— 否则拿不到 macOS GUI 上下文、屏幕录制（TCC）权限、USB/ADB 硬件访问。
-- phone-control 支持 headless 启动（窗口隐藏，控制 API + 轮询照常跑），由 LaunchAgent 拉起常驻。
+- phone-control 支持 **Tray-Only 启动**（窗口隐藏 + 系统托盘常驻，控制 API + 轮询照常跑），由 LaunchAgent 拉起。托盘「Open GUI」可随时拉出窗口调试。
 
 ### headless 启动
 
@@ -158,15 +165,21 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
 - [x] 抽 `install_apk` 共享逻辑（Tauri command 与控制 API 共用）
 - [x] axum 控制 API 骨架：health / devices / acquire / release / install
 - [x] `acquire` 释放设备 scrcpy 控制权（决策 #3）
-- [x] headless 启动开关（`tauri-plugin-cli` `--headless` / `PHONE_CONTROL_HEADLESS` env）
+- [x] `acquire` 单设备粒度 + `any`/`serial` 过滤 + `expires_at` TTL（默认 15min）+ 后台 sweeper 自动回收（决策 #1）
+- [x] Bearer-token 鉴权（env `PHONE_CONTROL_TOKEN` 或 `~/.phone_control/api_token`），仅绑 `127.0.0.1`（决策 #3-auth）
+- [x] headless 启动（`--headless` / `PHONE_CONTROL_HEADLESS` env）+ Tray-Only 常驻（决策 #4）
 - [ ] 3~5 条最核心 Android Maestro 用例（安装/启动/登录/首页）
 - [ ] Mac mini 配 Jenkins Agent，跑通「打包 → acquire → install → maestro → 结果」
 
 > ⚠️ 现实修正：原方案把「API 化 + iOS 冒烟」都压进 1~2 周。**iOS 是独立大头**（另一套 tidevice/simctl 工具链），Phase 1 只做 Android，iOS 单独排期。
 
 ### Phase 2 — 采集与产物聚合
-- [ ] `capture/start|stop`：`adb screenrecord` + `adb logcat` 落盘到 `output-dir`
-- [ ] 错误时自动 `screencap` 截图
+- [ ] **录屏（决策 #2）：scrcpy 纯视频流（video-only）→ Mac 本地 muxer 落盘 `.mp4`**
+  - 租约模式下 phone-control 断开 control socket、以 `control=false` 重连拿视频流
+  - 侧读 H.264 NAL → Rust muxer（`mp4` crate 或封装 ffmpeg）写盘
+  - 收益：无时长限制、不占手机存储、对手机 CPU 无二次开销
+  - ❌ 不用 `adb screenrecord`（3min 限制 + 占存 + 多一次 pull I/O）
+- [ ] `adb logcat` per task 落盘到 `output-dir`；错误时 `adb exec-out screencap` 截图
 - [ ] `smoke/report`：产物打包为 JUnit XML + JSON 供 Jenkins 解析
 - [ ] 飞书/钉钉机器人推送（编排层）
 
@@ -174,9 +187,17 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
 - [ ] 失败时把 logcat + 截图喂给 Claude 做根因分类（崩溃 / 环境 / 用例失效）
 - [ ] 经 Linear MCP 自动建单，挂载日志/录屏/AI 分析
 
-## 6. 待确认的开放问题
+## 6. 决策记录（原开放问题已定）
 
-1. **设备分配粒度**：一次冒烟固定 1 台，还是 `parallel-all` 全设备并行？（影响 lease 与 report 聚合）
-2. **录屏方案**：`adb screenrecord`（省 CPU、原生，但最长 ~3min/段、不支持部分模拟器）vs `scrcpy --record`（更灵活但吃 CPU）。
-3. **API 鉴权**：本机 `127.0.0.1` 是否够？多 Agent 共享一台 Mac 时是否需要 task token。
-4. **headless 形态**：完全无窗口，还是保留窗口便于人工旁观冒烟过程？
+1. **设备分配粒度** ✅ 单设备粒度，一次一台，**不做多设备组绑定**。并行 Job 各自调一次 `/acquire`。过滤：`any`（默认，任意空闲 Android）/ `serial`（精确机型，兼容性复现）。
+2. **录屏方案** ✅ **scrcpy 纯视频流写文件**（非 `adb screenrecord`）。理由见 Phase 2。
+3. **API 鉴权** ✅ `127.0.0.1` 绑定 + 动态 Bearer Token（env 或 `~/.phone_control/api_token`）。防本机杂散进程误触发 ADB。
+4. **headless 形态** ✅ 非纯 Daemon，而是 **Tray-Only（隐藏窗口 + 系统托盘）**。macOS TCC（屏幕录制/辅助功能/USB）需要 LaunchAgent 提供的 Aqua GUI 上下文，纯 LaunchDaemon 会导致 ADB 受阻或录屏黑屏。托盘「Open GUI」可随时拉出窗口调试。
+
+### 租约状态机（决策 #1 + #3）
+```
+Idle ──/acquire──▶ Leased(task_id, expires_at)
+                      │  ├─ /release            ──▶ Idle
+                      │  ├─ expires_at 到期(sweeper)──▶ Idle   ← 防僵尸锁
+                      │  └─ acquire 时同步 stop_stream_loop(force) 释放 UI 控制权（决策 #3）
+```

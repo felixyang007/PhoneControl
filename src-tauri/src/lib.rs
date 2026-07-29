@@ -1024,13 +1024,39 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // CI / Jenkins agent mode: run the control API + polling headless,
-            // hiding the window (the backend does not need the WebView).
+            // CI / Jenkins agent mode: not truly headless — a "tray-only" hidden
+            // window. macOS TCC (screen recording, accessibility, USB) needs the
+            // GUI/Aqua context a LaunchAgent provides, so we keep the app alive
+            // in the System Tray with the window hidden, rather than a daemon.
             if wants_headless(&app_handle) {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.hide();
                 }
-                println!("[APP] headless mode — window hidden, control API still active");
+
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::TrayIconBuilder;
+                let open = MenuItem::with_id(app, "open", "Open GUI", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("main-tray")
+                    .tooltip("phone-control (headless)")
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "open" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+
+                println!("[APP] headless mode — window hidden, tray active, control API on :9090");
             }
 
             let state = app.state::<AppState>();
@@ -1043,11 +1069,17 @@ pub fn run() {
             });
 
             // Start local HTTP control API for CI / smoke-test orchestration.
+            let api_token = control_api::resolve_api_token();
+            println!(
+                "[CTRL-API] bearer token at {} (or set PHONE_CONTROL_TOKEN)",
+                control_api::token_file_display()
+            );
             let control_state = control_api::ControlApiState::new(
                 Arc::clone(&state.servers),
                 Arc::clone(&state.adb_semaphore),
                 state.stream_tokens.clone(),
                 state.control_sockets.clone(),
+                api_token,
             );
             tauri::async_runtime::spawn(async move {
                 let _ =

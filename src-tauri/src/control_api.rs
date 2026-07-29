@@ -24,19 +24,68 @@
 //!   POST /api/v1/capture/start|stop      — TODO Phase 2 (screenrecord + logcat)
 //!   GET  /api/v1/smoke/report            — TODO Phase 2 (JUnit/JSON bundle)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, Semaphore};
+
+/// Default lease lifetime (15 min). A crashed/killed CI job that never calls
+/// `/release` has its lease reclaimed by the background sweeper after this.
+const DEFAULT_TTL_SECS: u64 = 15 * 60;
+/// How often the sweeper scans for expired leases.
+const SWEEP_INTERVAL_SECS: u64 = 30;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn token_file() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".phone_control");
+    let _ = std::fs::create_dir_all(&p);
+    p.push("api_token");
+    p
+}
+
+/// Resolve the API bearer token: `PHONE_CONTROL_TOKEN` env wins; otherwise read
+/// (or lazily generate) `~/.phone_control/api_token`. CI reads the same file.
+pub fn resolve_api_token() -> String {
+    if let Ok(tok) = std::env::var("PHONE_CONTROL_TOKEN") {
+        if !tok.trim().is_empty() {
+            return tok.trim().to_string();
+        }
+    }
+    let path = token_file();
+    if let Ok(tok) = std::fs::read_to_string(&path) {
+        if !tok.trim().is_empty() {
+            return tok.trim().to_string();
+        }
+    }
+    let tok = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::write(&path, &tok);
+    tok
+}
+
+/// Path shown in logs so a human/CI can find the token (never log the token).
+pub fn token_file_display() -> String {
+    token_file().display().to_string()
+}
 
 use crate::adb::commands::{install_apk, CommandResult, DeviceRef};
 use crate::adb::device::{parse_adb_devices, server_args};
@@ -50,6 +99,8 @@ pub struct Lease {
     pub server_host: String,
     pub server_port: u16,
     pub task_id: String,
+    /// Epoch seconds; reclaimed by the sweeper once passed (TTL safety net).
+    pub expires_at: u64,
 }
 
 /// Shared handles the API borrows from `AppState`, plus its own lease registry.
@@ -60,6 +111,8 @@ pub struct ControlApiState {
     pub stream_tokens: StreamTokens,
     pub control_sockets: ControlSockets,
     pub leases: Arc<StdMutex<HashMap<String, Lease>>>,
+    /// Bearer token required on every endpoint except `/health`.
+    pub token: String,
 }
 
 impl ControlApiState {
@@ -68,6 +121,7 @@ impl ControlApiState {
         adb_semaphore: Arc<Semaphore>,
         stream_tokens: StreamTokens,
         control_sockets: ControlSockets,
+        token: String,
     ) -> Self {
         Self {
             servers,
@@ -75,14 +129,57 @@ impl ControlApiState {
             stream_tokens,
             control_sockets,
             leases: Arc::new(StdMutex::new(HashMap::new())),
+            token,
         }
     }
 }
 
+/// Bearer-token gate for every endpoint except `/health`. Even though the API
+/// binds loopback only, this stops stray local processes from poking ADB.
+async fn require_auth(
+    State(st): State<ControlApiState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let provided = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim();
+    if !st.token.is_empty() && provided == st.token {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Background sweeper: reclaim leases whose TTL has passed (crashed/killed CI
+/// jobs that never called `/release`).
+fn spawn_lease_sweeper(leases: Arc<StdMutex<HashMap<String, Lease>>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+            let now = now_secs();
+            let mut map = leases.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, l| l.expires_at > now);
+            let removed = before - map.len();
+            if removed > 0 {
+                println!("[CTRL-API] swept {removed} expired lease(s)");
+            }
+        }
+    });
+}
+
 /// Start the control API. Spawned from `lib.rs::setup`, alongside the WS hub.
+/// Binds loopback only — never expose this off-box.
 pub async fn run_control_api(state: ControlApiState, addr: SocketAddr) -> Result<(), String> {
-    let app = Router::new()
-        .route("/api/v1/health", get(health))
+    spawn_lease_sweeper(Arc::clone(&state.leases));
+
+    // Everything except /health sits behind the bearer-token gate.
+    let protected = Router::new()
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/acquire", post(acquire_devices))
         .route("/api/v1/devices/release", post(release_devices))
@@ -90,12 +187,17 @@ pub async fn run_control_api(state: ControlApiState, addr: SocketAddr) -> Result
         .route("/api/v1/capture/start", post(capture_start))
         .route("/api/v1/capture/stop", post(capture_stop))
         .route("/api/v1/smoke/report", get(report))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let app = Router::new()
+        .route("/api/v1/health", get(health))
+        .merge(protected)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("control-api bind {addr}: {e}"))?;
-    println!("[CTRL-API] listening on http://{addr}");
+    println!("[CTRL-API] listening on http://{addr} (bearer-token protected)");
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("control-api serve: {e}"))
@@ -152,30 +254,30 @@ async fn list_devices(State(st): State<ControlApiState>) -> Json<Value> {
                 "server_host": d.server_host,
                 "server_port": d.server_port,
                 "leased_by": leased.get(&d.serial).map(|l| l.task_id.clone()),
+                "leased_until": leased.get(&d.serial).map(|l| l.expires_at),
             })
         })
         .collect();
     Json(json!({ "devices": list }))
 }
 
-fn default_count() -> usize {
-    1
-}
-
 #[derive(Deserialize)]
 struct AcquireReq {
     task_id: String,
-    #[serde(default = "default_count")]
-    count: usize,
-    /// Optional explicit serials; when empty, pick any idle devices.
+    /// Exact device to lease (compatibility repro). Absent = "any" idle device
+    /// — the common case. One device per call; Jenkins parallel jobs each call
+    /// `/acquire` independently (no multi-device group binding).
     #[serde(default)]
-    serials: Vec<String>,
+    serial: Option<String>,
+    /// Lease lifetime in seconds; defaults to 15 min. Auto-reclaimed on expiry.
+    #[serde(default)]
+    ttl_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct AcquireResp {
     task_id: String,
-    devices: Vec<Lease>,
+    device: Lease,
 }
 
 async fn acquire_devices(
@@ -183,64 +285,56 @@ async fn acquire_devices(
     Json(req): Json<AcquireReq>,
 ) -> Result<Json<AcquireResp>, (StatusCode, String)> {
     let available = online_devices(&st.servers).await;
-    let already_leased: HashSet<String> =
+    let leased: std::collections::HashSet<String> =
         { st.leases.lock().unwrap().keys().cloned().collect() };
 
-    let mut chosen: Vec<DeviceRef> = Vec::new();
-    for d in available {
-        if already_leased.contains(&d.serial) {
-            continue;
-        }
-        if req.serials.is_empty() {
-            chosen.push(d);
-            if chosen.len() >= req.count {
-                break;
+    let chosen: DeviceRef = match &req.serial {
+        // `serial` filter — exact device.
+        Some(serial) => {
+            if leased.contains(serial) {
+                return Err((StatusCode::CONFLICT, format!("device {serial} already leased")));
             }
-        } else if req.serials.contains(&d.serial) {
-            chosen.push(d);
+            available
+                .into_iter()
+                .find(|d| &d.serial == serial)
+                .ok_or((StatusCode::CONFLICT, format!("device {serial} not online")))?
         }
-    }
-
-    if chosen.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            "no idle devices available for lease".into(),
-        ));
-    }
+        // `any` filter — first idle device.
+        None => available
+            .into_iter()
+            .find(|d| !leased.contains(&d.serial))
+            .ok_or((StatusCode::CONFLICT, "no idle device available".to_string()))?,
+    };
 
     // Decision #3: phone-control must not hold a device while Maestro drives it.
     // Free the scrcpy stream/control socket before handing the serial to CI.
-    for d in &chosen {
-        stop_stream_loop(
-            Arc::clone(&st.stream_tokens),
-            Arc::clone(&st.control_sockets),
-            &d.serial,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-    }
+    stop_stream_loop(
+        Arc::clone(&st.stream_tokens),
+        Arc::clone(&st.control_sockets),
+        &chosen.serial,
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
 
-    let mut leases = Vec::with_capacity(chosen.len());
-    {
-        let mut map = st.leases.lock().unwrap();
-        for d in chosen {
-            let lease = Lease {
-                serial: d.serial.clone(),
-                server_host: d.server_host,
-                server_port: d.server_port,
-                task_id: req.task_id.clone(),
-            };
-            map.insert(d.serial.clone(), lease.clone());
-            leases.push(lease);
-        }
-    }
+    let ttl = req.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+    let lease = Lease {
+        serial: chosen.serial.clone(),
+        server_host: chosen.server_host,
+        server_port: chosen.server_port,
+        task_id: req.task_id.clone(),
+        expires_at: now_secs() + ttl,
+    };
+    st.leases
+        .lock()
+        .unwrap()
+        .insert(chosen.serial.clone(), lease.clone());
 
     Ok(Json(AcquireResp {
         task_id: req.task_id,
-        devices: leases,
+        device: lease,
     }))
 }
 
