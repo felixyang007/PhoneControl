@@ -1,0 +1,143 @@
+# phone-control × 移动端自动化冒烟测试 — 集成设计
+
+> 目标：提测/打包完成后，CI 自动调起冒烟测试，10 分钟内验证 App 核心功能是否可用。
+> 本文定义 phone-control 在这条流水线里承担的职责、需要做的改造，以及分阶段落地计划。
+
+## 0. 一个关键事实纠正
+
+原方案把 phone-control 描述为 **Electron / Native**，并据此建议「用 Node.js/Golang 做 CLI 包装」。
+**实际架构是 Tauri 2（Rust 后端 + WebView 前端）**，进程内已内建一个本地 server（[`ws.rs`](../src-tauri/src/ws.rs) 的 `127.0.0.1:32199` 视频帧 WebSocket）。
+
+影响：
+- **方式 A（内置 HTTP API）是顺路活** —— 在同一个 Tokio 运行时里再挂一个 axum 服务即可，无需另起进程/语言。✅ 采用。
+- **方式 B（Node CLI 包装）是弯路**，不采用。真需要 CLI，做个瘦 Rust bin 调 HTTP API 即可。
+- 现有 `:32199` 那个 WS 是纯二进制视频帧流，不是控制通道，不能改造成 REST，故新开 `:9090`。
+
+## 1. 职责边界（本设计的核心决策）
+
+phone-control 只做它握着 ADB 连接的**独家优势**部分，其余交给流水线的其他环节。
+
+| 环节 | 归属 | 理由 |
+|---|---|---|
+| 设备调度 / 分配 / 健康检查 | **phone-control** | 它已持有 ADB fleet 连接与轮询 |
+| 装包（APK 安装 / 权限预置） | **phone-control** | host-side `adb install`，已实现 Android |
+| 采集（录屏 / logcat / 截图 / 产物打包） | **phone-control** | 旁路采集，独立于 UI 驱动 |
+| **UI 驱动（跑 Maestro / Appium 用例）** | **Maestro / Appium（不在 App 内）** | 见决策 #3 |
+| AI 归因 / Linear 建单 / 飞书推送 | **CI 编排层（Claude Code + MCP）** | 凭据管理与可维护性不该进 GUI |
+
+### 决策 #3：phone-control 不碰 UI 驱动，UI 全交给 Maestro
+
+**为什么**：phone-control 会占用每台设备的 scrcpy **video + control socket**（见 [`scrcpy_client.rs`](../src-tauri/src/adb/scrcpy_client.rs)、[`stream.rs`](../src-tauri/src/adb/stream.rs)）。Maestro/Appium 也要独占驱动同一台设备的 UI。**两者同时驱动一台设备必冲突**。
+
+Maestro 本身是个 CLI，直接通过 adb 跟设备通信，根本不需要 phone-control 来跑它。把它塞进 GUI App 只会让 App 变巨石、难测。
+
+**落地约束**：
+- `acquire` 一台设备给冒烟任务时，phone-control **主动释放**该设备的 scrcpy 流与控制 socket（`stop_stream_loop(force=true)`），之后不再对它做任何 tap/swipe/text。
+- Jenkins 拿到分配的 serial 后，**自己**跑 `maestro test --device <serial>`。
+- 采集（`adb screenrecord` / `adb logcat`）走**独立 adb 通道**，与 Maestro 的输入注入互不干扰，可全程并行。
+
+```
+[Jenkins]
+   │ 1. POST /devices/acquire   → 拿到空闲 serial（phone-control 已释放该设备控制权）
+   │ 2. POST /install           → adb install -r 测试包
+   │ 3. POST /capture/start     → phone-control 后台起 screenrecord + logcat（旁路）
+   │ 4. maestro test --device <serial> ...   ← Jenkins 直接驱动 UI，phone-control 不参与
+   │ 5. POST /capture/stop       → 收尾产物
+   │ 6. GET  /smoke/report       → 取产物路径（JUnit/JSON + mp4 + log）
+   │ 7. POST /devices/release    → 归还设备
+   ▼
+[失败用例] → CI 把 log/截图喂给 Claude 分析 → 调 Linear MCP 建单 → 飞书推送
+```
+
+## 2. 现状 vs 目标：差距表
+
+（✅ 已具备 / 🟡 部分 / ❌ 缺失 —— 均对照当前代码核对）
+
+| 能力 | 现状 | 需要做什么 |
+|---|---|---|
+| CI 触发（HTTP API） | ❌ Tauri command 仅 WebView IPC 可调 | **本分支已起骨架**：axum `:9090` |
+| 设备检测 | 🟡 `poll_all_servers` 轮询 + 状态解析 | 已可用；补离线自动重连 |
+| 设备分配 / 租约 | ❌ 无「空闲锁定」概念 | **本分支已起骨架**：内存 lease 表 |
+| 安装 APK | ✅ `install_apk_devices`（并行 `-r`，信号量限流） | 已复用为共享 `adb::commands::install_apk` |
+| 权限预置 | ❌ | 加 `install -g` / `pm grant` / appops |
+| 清装（先卸后装） | ❌ | 加 `adb uninstall` 前置选项 |
+| 录屏落盘 | 🟡 有 H.264 实时流，不存文件 | `adb screenrecord`（或 `scrcpy --record`）→ mp4 |
+| 截图 | ❌ 旧 JPEG 路径已删 | `adb exec-out screencap` |
+| Logcat | ❌ | `adb logcat` per device/task 落盘 |
+| 性能指标 | ❌ | dumpsys / perfetto，较重，后置 |
+| 产物打包（JUnit/JSON） | ❌ | 标准化 `output-dir` + report bundle |
+| iOS（IPA/simctl/tidevice） | ❌ 纯 ADB | **独立大工程**，单独排期 |
+| macOS headless + 录屏权限 | ❌ 仅 GUI 启动 | 支持自启开 API；配合 LaunchAgent + TCC 授权 |
+| AI 归因 / Linear / 飞书 | ❌ | 放 CI 编排层，不进 App |
+
+## 3. HTTP 控制 API 规格（`127.0.0.1:9090`）
+
+实现见 [`control_api.rs`](../src-tauri/src/control_api.rs)。
+
+| 方法 | 路径 | 说明 | 状态 |
+|---|---|---|---|
+| GET | `/api/v1/health` | 健康检查 | ✅ 骨架 |
+| GET | `/api/v1/devices` | 在线设备 + 租约归属 | ✅ 骨架 |
+| POST | `/api/v1/devices/acquire` | 租用空闲设备（并释放其 scrcpy 控制权） | ✅ 骨架 |
+| POST | `/api/v1/devices/release` | 按 `task_id` 归还租约 | ✅ 骨架 |
+| POST | `/api/v1/install` | `adb install -r`（复用共享逻辑） | ✅ 骨架 |
+| POST | `/api/v1/capture/start` | 起 screenrecord + logcat | ⏳ Phase 2（stub 501） |
+| POST | `/api/v1/capture/stop` | 收尾产物 | ⏳ Phase 2（stub 501） |
+| GET | `/api/v1/smoke/report` | JUnit/JSON 产物包 | ⏳ Phase 2（stub 501） |
+
+示例：
+
+```bash
+# 1) 租一台空闲设备给本次任务
+curl -s localhost:9090/api/v1/devices/acquire \
+  -H 'content-type: application/json' \
+  -d '{"task_id":"build-1234","count":1}'
+# → {"task_id":"build-1234","devices":[{"serial":"emulator-5554",...}]}
+
+# 2) 装包到该任务租用的设备
+curl -s localhost:9090/api/v1/install \
+  -H 'content-type: application/json' \
+  -d '{"task_id":"build-1234","apk_path":"/path/to/app-debug.apk"}'
+
+# 3) Jenkins 自己驱动 UI（phone-control 已让出该设备）
+maestro test --device emulator-5554 ./smoke-tests/
+
+# 4) 归还
+curl -s localhost:9090/api/v1/devices/release \
+  -H 'content-type: application/json' -d '{"task_id":"build-1234"}'
+```
+
+## 4. 部署拓扑（Jenkins Agent on Mac）
+
+- Mac mini / Mac Studio 装 phone-control，作为 Jenkins **Dedicated Agent**。
+- Agent 必须以 **GUI 用户自动登录（Auto-login）+ LaunchAgent** 启动，**不能**用 LaunchDaemon 后台服务 —— 否则拿不到 macOS GUI 上下文、屏幕录制（TCC）权限、USB/ADB 硬件访问。
+- phone-control 需支持「启动即开 API」（后续加 headless / 隐藏窗口开关），由 LaunchAgent 拉起常驻。
+
+## 5. 分阶段落地
+
+### Phase 1 — API 化 + 基础链路（本分支起步）
+- [x] 抽 `install_apk` 共享逻辑（Tauri command 与控制 API 共用）
+- [x] axum 控制 API 骨架：health / devices / acquire / release / install
+- [x] `acquire` 释放设备 scrcpy 控制权（决策 #3）
+- [ ] headless 启动开关（`tauri-plugin-cli` / env）
+- [ ] 3~5 条最核心 Android Maestro 用例（安装/启动/登录/首页）
+- [ ] Mac mini 配 Jenkins Agent，跑通「打包 → acquire → install → maestro → 结果」
+
+> ⚠️ 现实修正：原方案把「API 化 + iOS 冒烟」都压进 1~2 周。**iOS 是独立大头**（另一套 tidevice/simctl 工具链），Phase 1 只做 Android，iOS 单独排期。
+
+### Phase 2 — 采集与产物聚合
+- [ ] `capture/start|stop`：`adb screenrecord` + `adb logcat` 落盘到 `output-dir`
+- [ ] 错误时自动 `screencap` 截图
+- [ ] `smoke/report`：产物打包为 JUnit XML + JSON 供 Jenkins 解析
+- [ ] 飞书/钉钉机器人推送（编排层）
+
+### Phase 3 — AI 诊断与 Linear 联动（编排层，不进 App）
+- [ ] 失败时把 logcat + 截图喂给 Claude 做根因分类（崩溃 / 环境 / 用例失效）
+- [ ] 经 Linear MCP 自动建单，挂载日志/录屏/AI 分析
+
+## 6. 待确认的开放问题
+
+1. **设备分配粒度**：一次冒烟固定 1 台，还是 `parallel-all` 全设备并行？（影响 lease 与 report 聚合）
+2. **录屏方案**：`adb screenrecord`（省 CPU、原生，但最长 ~3min/段、不支持部分模拟器）vs `scrcpy --record`（更灵活但吃 CPU）。
+3. **API 鉴权**：本机 `127.0.0.1` 是否够？多 Agent 共享一台 Mac 时是否需要 task token。
+4. **headless 形态**：完全无窗口，还是保留窗口便于人工旁观冒烟过程？

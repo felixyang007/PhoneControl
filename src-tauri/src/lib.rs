@@ -1,5 +1,6 @@
 pub mod adb;
 mod config;
+mod control_api;
 mod state;
 mod ws;
 
@@ -919,72 +920,22 @@ async fn install_apk_devices(
     apk_path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<CommandResult>, String> {
-    use adb::device::server_args;
-
     // Fail fast with one clear error instead of N identical adb failures.
     if !std::path::Path::new(&apk_path).is_file() {
         return Err(format!("APK not found: {apk_path}"));
     }
 
-    let sem = Arc::clone(&state.adb_semaphore);
-    let handles: Vec<_> = serials
+    let devices = serials
         .into_iter()
-        .map(|d| {
-            let apk_path = apk_path.clone();
-            let sem = Arc::clone(&sem);
-            tokio::spawn(async move {
-                // Bound concurrent installs to the global ADB budget.
-                let _permit = sem.acquire_owned().await;
-                let serial = d.serial.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut args = server_args(&d.server_host, d.server_port);
-                    args.extend([
-                        "-s".into(),
-                        d.serial.clone(),
-                        "install".into(),
-                        "-r".into(),
-                        apk_path,
-                    ]);
-                    let out = std::process::Command::new(adb::binaries::adb())
-                        .args(&args)
-                        .output();
-                    match out {
-                        Ok(o) => {
-                            let text = String::from_utf8_lossy(&o.stdout).to_string()
-                                + &String::from_utf8_lossy(&o.stderr);
-                            // `adb install` can exit 0 while the device reports
-                            // `Failure [...]`, so inspect the output too.
-                            let success = o.status.success()
-                                && !text.contains("Failure")
-                                && !text.contains("Error");
-                            CommandResult {
-                                serial: d.serial.clone(),
-                                success,
-                                message: text.trim().to_string(),
-                            }
-                        }
-                        Err(e) => CommandResult {
-                            serial: d.serial.clone(),
-                            success: false,
-                            message: e.to_string(),
-                        },
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| CommandResult {
-                    serial,
-                    success: false,
-                    message: format!("install task failed: {e}"),
-                })
-            })
+        .map(|d| adb::commands::DeviceRef {
+            serial: d.serial,
+            server_host: d.server_host,
+            server_port: d.server_port,
         })
         .collect();
 
-    let mut results = Vec::with_capacity(handles.len());
-    for h in handles {
-        results.push(h.await.map_err(|e| e.to_string())?);
-    }
-    Ok(results)
+    // Shared with the CI control API — see adb::commands::install_apk.
+    Ok(adb::commands::install_apk(devices, apk_path, Arc::clone(&state.adb_semaphore)).await)
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -1054,6 +1005,19 @@ pub fn run() {
             let hub = app.state::<WsHub>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = run_ws_server(hub, "127.0.0.1:32199".parse().unwrap()).await;
+            });
+
+            // Start local HTTP control API for CI / smoke-test orchestration.
+            let control_state = control_api::ControlApiState::new(
+                Arc::clone(&state.servers),
+                Arc::clone(&state.adb_semaphore),
+                state.stream_tokens.clone(),
+                state.control_sockets.clone(),
+            );
+            tauri::async_runtime::spawn(async move {
+                let _ =
+                    control_api::run_control_api(control_state, "127.0.0.1:9090".parse().unwrap())
+                        .await;
             });
 
             tauri::async_runtime::spawn(async move {

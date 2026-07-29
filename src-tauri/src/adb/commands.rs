@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use super::device::server_args;
 
@@ -9,6 +11,87 @@ pub struct CommandResult {
     pub serial: String,
     pub success: bool,
     pub message: String,
+}
+
+/// A device targeted by a host-side adb operation (no resolution needed, unlike
+/// `DeviceResolution` which the UI uses for coordinate scaling).
+#[derive(Debug, Clone)]
+pub struct DeviceRef {
+    pub serial: String,
+    pub server_host: String,
+    pub server_port: u16,
+}
+
+/// Host-side `adb install -r <apk>` fanned out across `devices`, bounded by
+/// `sem` (one permit each) so a large fleet doesn't swamp the adb server —
+/// pushing a full APK is far heavier than a tap.
+///
+/// Shared by the Tauri command (`install_apk_devices`) and the CI control API,
+/// so both paths get identical semantics and the resolved-adb-path handling.
+pub async fn install_apk(
+    devices: Vec<DeviceRef>,
+    apk_path: String,
+    sem: Arc<Semaphore>,
+) -> Vec<CommandResult> {
+    let handles: Vec<_> = devices
+        .into_iter()
+        .map(|d| {
+            let apk_path = apk_path.clone();
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                let serial = d.serial.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut args = server_args(&d.server_host, d.server_port);
+                    args.extend([
+                        "-s".into(),
+                        d.serial.clone(),
+                        "install".into(),
+                        "-r".into(),
+                        apk_path,
+                    ]);
+                    let out = Command::new(super::binaries::adb()).args(&args).output();
+                    match out {
+                        Ok(o) => {
+                            let text = String::from_utf8_lossy(&o.stdout).to_string()
+                                + &String::from_utf8_lossy(&o.stderr);
+                            // `adb install` can exit 0 while the device reports
+                            // `Failure [...]`, so inspect the output too.
+                            let success = o.status.success()
+                                && !text.contains("Failure")
+                                && !text.contains("Error");
+                            CommandResult {
+                                serial: d.serial.clone(),
+                                success,
+                                message: text.trim().to_string(),
+                            }
+                        }
+                        Err(e) => CommandResult {
+                            serial: d.serial.clone(),
+                            success: false,
+                            message: e.to_string(),
+                        },
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| CommandResult {
+                    serial,
+                    success: false,
+                    message: format!("install task failed: {e}"),
+                })
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        results.push(h.await.unwrap_or_else(|e| CommandResult {
+            serial: String::new(),
+            success: false,
+            message: e.to_string(),
+        }));
+    }
+    results
 }
 
 fn scale(value: f64, source_dim: u32, target_dim: u32) -> i32 {

@@ -31,6 +31,9 @@ futures = "0.3"
 dirs-next = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+# Local HTTP control API for CI / smoke-test orchestration (Jenkins → curl)
+axum = "0.7"
+
 # Local WebSocket for high-frequency video frames
 tokio-tungstenite = "0.27"
 tungstenite = "0.27"
