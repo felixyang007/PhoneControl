@@ -947,6 +947,30 @@ async fn load_config(state: State<'_, AppState>) -> Result<Vec<AdbServer>, Strin
 
 // ── App entry ────────────────────────────────────────────────────────────────
 
+/// Whether to start without a visible window (CI / Jenkins agent mode).
+///
+/// Two equivalent triggers: the `--headless`/`-H` CLI flag, or the
+/// `PHONE_CONTROL_HEADLESS=1` env var (the natural fit for a LaunchAgent plist).
+/// Either way the control API and device polling still run — only the window
+/// is hidden.
+fn wants_headless(handle: &AppHandle) -> bool {
+    if std::env::var("PHONE_CONTROL_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    use tauri_plugin_cli::CliExt;
+    match handle.cli().matches() {
+        Ok(m) => m
+            .args
+            .get("headless")
+            .map(|a| a.value == serde_json::Value::Bool(true))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Ensure adb/scrcpy are findable in bundled macOS app
@@ -973,6 +997,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_cli::init())
         .manage(app_state)
         .manage(ws_hub)
         .invoke_handler(tauri::generate_handler![
@@ -998,6 +1023,16 @@ pub fn run() {
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // CI / Jenkins agent mode: run the control API + polling headless,
+            // hiding the window (the backend does not need the WebView).
+            if wants_headless(&app_handle) {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
+                println!("[APP] headless mode — window hidden, control API still active");
+            }
+
             let state = app.state::<AppState>();
             let servers = Arc::clone(&state.servers);
 

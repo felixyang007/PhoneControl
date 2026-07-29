@@ -21,6 +21,19 @@
       "csp": null
     }
   },
+  "plugins": {
+    "cli": {
+      "description": "phone-control — multi-device Android orchestration",
+      "args": [
+        {
+          "name": "headless",
+          "short": "H",
+          "description": "Start without showing the window (for CI / Jenkins agents). Same as env PHONE_CONTROL_HEADLESS=1. The control API on :9090 and device polling still run.",
+          "takesValue": false
+        }
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

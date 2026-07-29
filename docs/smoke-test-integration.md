@@ -111,7 +111,46 @@ curl -s localhost:9090/api/v1/devices/release \
 
 - Mac mini / Mac Studio 装 phone-control，作为 Jenkins **Dedicated Agent**。
 - Agent 必须以 **GUI 用户自动登录（Auto-login）+ LaunchAgent** 启动，**不能**用 LaunchDaemon 后台服务 —— 否则拿不到 macOS GUI 上下文、屏幕录制（TCC）权限、USB/ADB 硬件访问。
-- phone-control 需支持「启动即开 API」（后续加 headless / 隐藏窗口开关），由 LaunchAgent 拉起常驻。
+- phone-control 支持 headless 启动（窗口隐藏，控制 API + 轮询照常跑），由 LaunchAgent 拉起常驻。
+
+### headless 启动
+
+两种等效触发方式（二选一）：
+
+```bash
+# 1) CLI flag（bundled .app 里的可执行文件）
+/Applications/phone-control.app/Contents/MacOS/phone-control --headless
+
+# 2) 环境变量（LaunchAgent plist 里更自然）
+PHONE_CONTROL_HEADLESS=1 /Applications/phone-control.app/Contents/MacOS/phone-control
+```
+
+LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用户级 Agent，非 Daemon**，保证 GUI/TCC 上下文）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mac.phone-control</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/phone-control.app/Contents/MacOS/phone-control</string>
+    <string>--headless</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- 若 adb/scrcpy 不在默认 PATH，可显式指定 -->
+    <key>ADB_PATH</key><string>/opt/homebrew/bin/adb</string>
+    <key>SCRCPY_PATH</key><string>/opt/homebrew/bin/scrcpy</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+> 首次运行仍需在「系统设置 → 隐私与安全性 → 屏幕录制」里授权 phone-control（TCC 无法脚本静默授权），之后 LaunchAgent 常驻即可。CI 用 `curl localhost:9090/api/v1/health` 探活。
 
 ## 5. 分阶段落地
 
@@ -119,7 +158,7 @@ curl -s localhost:9090/api/v1/devices/release \
 - [x] 抽 `install_apk` 共享逻辑（Tauri command 与控制 API 共用）
 - [x] axum 控制 API 骨架：health / devices / acquire / release / install
 - [x] `acquire` 释放设备 scrcpy 控制权（决策 #3）
-- [ ] headless 启动开关（`tauri-plugin-cli` / env）
+- [x] headless 启动开关（`tauri-plugin-cli` `--headless` / `PHONE_CONTROL_HEADLESS` env）
 - [ ] 3~5 条最核心 Android Maestro 用例（安装/启动/登录/首页）
 - [ ] Mac mini 配 Jenkins Agent，跑通「打包 → acquire → install → maestro → 结果」
 
