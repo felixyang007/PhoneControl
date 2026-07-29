@@ -1,0 +1,86 @@
+// Smoke-test pipeline. Runs on a Mac agent that has phone-control (control API
+// on :9090), adb, scrcpy, maestro, jq. See docs/jenkins-setup.md for agent setup.
+//
+// The Mac agent MUST run as a LaunchAgent under an auto-login GUI user (not a
+// LaunchDaemon) so it has the Aqua/TCC context for screen recording + USB/ADB.
+
+pipeline {
+  // Pin to the Mac device-lab node (set this label on the agent in Jenkins).
+  agent { label 'mac-device-lab' }
+
+  parameters {
+    string(name: 'FLOW', defaultValue: 'smoke-tests/settings-smoke.yaml',
+           description: 'Maestro flow to run')
+    string(name: 'APK_PATH', defaultValue: '',
+           description: 'APK to install first (empty = test whatever is installed). A path on the agent, or use a Copy-Artifact step upstream.')
+    string(name: 'DEVICE_SERIAL', defaultValue: '',
+           description: 'Specific device serial, or empty to lease any idle device')
+    booleanParam(name: 'FILE_LINEAR', defaultValue: false,
+           description: 'On failure, file a Linear bug (needs Linear MCP configured on the agent)')
+  }
+
+  options {
+    // On abort/timeout Jenkins sends SIGTERM to the process group — smoke-run.sh's
+    // trap then still runs capture/stop + report + release. 15m is the hard cap.
+    timeout(time: 15, unit: 'MINUTES')
+    disableConcurrentBuilds()   // one smoke run per node at a time
+  }
+
+  environment {
+    // Homebrew + Maestro on PATH for a non-login Jenkins shell.
+    PATH      = "/opt/homebrew/bin:${HOME}/.maestro/bin:${env.PATH}"
+    TASK      = "${env.JOB_NAME}-${env.BUILD_NUMBER}"
+    ARTIFACTS = "${env.WORKSPACE}/artifacts"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Preflight') {
+      steps {
+        sh '''
+          set -e
+          mkdir -p "$ARTIFACTS"
+          adb version | head -1
+          maestro -v | head -1
+          # phone-control must already be running (LaunchAgent). Fail fast if not.
+          curl -sf http://127.0.0.1:9090/api/v1/health \
+            || { echo "phone-control control API not up on :9090"; exit 1; }
+        '''
+      }
+    }
+
+    stage('Smoke') {
+      steps {
+        sh '''
+          set -e
+          serialArg=""; [ -n "$DEVICE_SERIAL" ] && serialArg="--serial $DEVICE_SERIAL"
+          apkArg="";     [ -n "$APK_PATH" ]     && apkArg="--apk $APK_PATH"
+          triageArg="--triage"; [ "$FILE_LINEAR" = "true" ] && triageArg="--triage-create"
+
+          # Token is read from ~/.phone_control/api_token by smoke-run.sh.
+          # (Or inject a Jenkins credential as PHONE_CONTROL_TOKEN.)
+          smoke-tests/smoke-run.sh \
+            --flow "$FLOW" $serialArg $apkArg \
+            --task "$TASK" \
+            --output-dir "$ARTIFACTS" \
+            --junit "$ARTIFACTS/junit.xml" \
+            $triageArg
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      // mp4 + logcat + manifest + junit — archived even on failure (trap wrote them).
+      archiveArtifacts artifacts: 'artifacts/**', allowEmptyArchive: true, fingerprint: true
+      junit testResults: 'artifacts/junit.xml', allowEmptyResults: true
+    }
+    failure {
+      echo "Smoke failed — see artifacts/${TASK}-manifest.json for the AI triage + logcat/mp4."
+    }
+  }
+}

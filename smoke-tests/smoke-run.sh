@@ -19,7 +19,7 @@ set -uo pipefail
 API="${SMOKE_API:-http://127.0.0.1:9090}"
 TOKEN="${PHONE_CONTROL_TOKEN:-$(cat "$HOME/.phone_control/api_token" 2>/dev/null || true)}"
 TASK="smoke-$$-$(date +%s)"
-FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE=""
+FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE="" ; JUNIT=""
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
@@ -29,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --serial)        SERIAL="$2"; shift 2;;
     --task)          TASK="$2"; shift 2;;
     --output-dir)    OUTPUT_DIR="$2"; shift 2;;
+    --junit)         JUNIT="$2"; shift 2;;       # write Maestro JUnit XML here
     --api)           API="$2"; shift 2;;
     --triage)        TRIAGE="dry-run"; shift;;   # AI root-cause on failure
     --triage-create) TRIAGE="create"; shift;;    # …and file a Linear bug
@@ -107,7 +108,12 @@ echo "▸ capture started"
 #    finalize (trap) runs on the way out — steps 5/6/7 happen there.
 if command -v maestro >/dev/null 2>&1; then
   echo "▸ maestro test --device $SERIAL $FLOW"
-  maestro test --device "$SERIAL" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
+  if [[ -n "$JUNIT" ]]; then
+    # JUnit XML for Jenkins' `junit` step to parse into pass/fail.
+    maestro test --device "$SERIAL" --format junit --output "$JUNIT" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
+  else
+    maestro test --device "$SERIAL" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
+  fi
 else
   echo "▸ WARN: maestro not installed — UI flow SKIPPED."
   echo "        install: curl -Ls https://get.maestro.mobile.dev | bash"

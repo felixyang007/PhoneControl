@@ -28,9 +28,15 @@ capture (mp4 + logcat); **Maestro** drives the UI. The orchestrator glues them.
 ```
 
 ## Jenkins
+Ready-to-use pipeline: [`Jenkinsfile`](Jenkinsfile). Full node/agent setup (the
+GUI-context/LaunchAgent requirement, TCC, credentials, job creation):
+[`../docs/jenkins-setup.md`](../docs/jenkins-setup.md).
+
+Minimal shell if you'd rather script it yourself:
 ```bash
-sh 'smoke-tests/smoke-run.sh --flow smoke-tests/app-smoke.yaml --apk app-debug.apk --task ${BUILD_TAG} --output-dir ${WORKSPACE}/artifacts'
-// artifacts/<task>-manifest.json lists the mp4 + logcat to archive / attach to Linear
+sh 'smoke-tests/smoke-run.sh --flow smoke-tests/app-smoke.yaml --apk app-debug.apk \
+      --task ${BUILD_TAG} --output-dir ${WORKSPACE}/artifacts --junit ${WORKSPACE}/artifacts/junit.xml --triage'
+// junit artifacts/junit.xml → Test Result; artifacts/<task>-manifest.json → mp4+logcat+AI triage
 ```
 
 `smoke-run.sh` is exception-safe: a Maestro failure, a CI SIGTERM, or Ctrl-C all
