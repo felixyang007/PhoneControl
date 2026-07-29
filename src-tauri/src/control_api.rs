@@ -343,18 +343,12 @@ async fn acquire_devices(
             .ok_or((StatusCode::CONFLICT, "no idle device available".to_string()))?,
     };
 
-    // Decision #3: phone-control must not hold a device while Maestro drives it.
-    // Free the scrcpy stream/control socket before handing the serial to CI.
-    stop_stream_loop(
-        Arc::clone(&st.stream_tokens),
-        Arc::clone(&st.control_sockets),
-        &chosen.serial,
-        None,
-        None,
-        None,
-        true,
-    )
-    .await;
+    // Decision #3 (refined): release only the *control* socket so phone-control
+    // can't inject input while Maestro drives — but KEEP the video-only mirror
+    // running so an operator can watch the automation live in the UI. A
+    // read-only H.264 mirror doesn't contend with Maestro's UiAutomator input
+    // channel (proven: recording streams video the whole time Maestro runs).
+    st.control_sockets.lock().unwrap().remove(&chosen.serial);
 
     let ttl = req.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
     let lease = Lease {
@@ -626,7 +620,9 @@ async fn capture_stop(
         .ok_or((StatusCode::NOT_FOUND, format!("no recording for {serial}")))?;
     let task_id = recorder.task_id.clone();
 
-    // Stop the video-only stream we started for recording.
+    // Release the recorder's stream client (ref-counted, not forced): if an
+    // operator is watching this device live, their stream stays up; if the
+    // recorder was the only client, the stream stops.
     stop_stream_loop(
         Arc::clone(&st.stream_tokens),
         Arc::clone(&st.control_sockets),
@@ -634,7 +630,7 @@ async fn capture_stop(
         None,
         None,
         Some(&rec_client_id(&serial)),
-        true,
+        false,
     )
     .await;
 
