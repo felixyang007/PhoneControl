@@ -163,6 +163,23 @@ const adbCommands = {
     async wakeUpDevices(serials: DeviceResolution[]): Promise<CommandResult[]> {
       return invoke<CommandResult[]>('wake_up_devices', { serials });
     },
+
+    // Host-side `adb install -r <apk>` broadcast to selected online devices.
+    // NOTE: host adb command, not a device shell command — installs as the adb
+    // user and bypasses the device-side "unknown sources" prompt.
+    async installApk(apkPath: string): Promise<CommandResult[]> {
+      const { devices, selectedSerials } = useStore.getState();
+      const serials: DeviceResolution[] = devices
+        .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
+        .map((d) => ({
+          serial: d.serial,
+          width: d.screen_width,
+          height: d.screen_height,
+          server_host: d.server_host,
+          server_port: d.server_port,
+        }));
+      return invoke<CommandResult[]>('install_apk_devices', { serials, apkPath });
+    },
 };
 
 export function useAdbCommands() {

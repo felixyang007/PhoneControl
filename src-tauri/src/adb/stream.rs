@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use super::scrcpy_client::{FRAME_HEADER_LEN, SESSION_META_LEN};
 use crate::ws::WsHub;
 
 // (placeholder) server_args will be used by protocol-level client
@@ -102,6 +103,22 @@ fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason:
             println!(
                 "[SCRCPY-CTRL] removed control socket serial={} reason={}",
                 serial, reason
+            );
+        }
+    }
+}
+
+/// Record the encoder's current output size so touch coordinates scale against
+/// the same resolution the browser is painting. On scrcpy 4.x this is called
+/// again whenever the device rotates, not just once at startup.
+fn publish_video_size(control_sockets: &ControlSockets, serial: &str, width: u32, height: u32) {
+    if let Ok(mut sockets) = control_sockets.lock() {
+        if let Some(entry) = sockets.get_mut(serial) {
+            entry.video_width = width;
+            entry.video_height = height;
+            println!(
+                "[SCRCPY-FWD] updated control socket video size serial={} {}x{}",
+                serial, width, height
             );
         }
     }
@@ -549,6 +566,11 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
 
+    // scrcpy 4.0 reshaped the video socket; pick the layout that matches the
+    // local scrcpy rather than assuming the 3.x one.
+    let wire =
+        super::scrcpy_client::video_wire_format(super::scrcpy_client::scrcpy_major_version());
+
     let mut dummy_consumed = false;
     let mut codec_meta_consumed = false;
     let mut video_width: u32 = 0;
@@ -629,25 +651,20 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             }
             dummy_consumed = true;
         }
-        if dummy_consumed && !codec_meta_consumed && buf.len() >= 12 {
+        if dummy_consumed && !codec_meta_consumed && buf.len() >= wire.header_len {
             let fourcc = parse_codec_fourcc(&buf[0..4]);
-            video_width = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-            video_height = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-            println!(
-                "[SCRCPY-FWD] codec meta serial={} codec={} w={} h={}",
-                serial, fourcc, video_width, video_height
-            );
-            if let Ok(mut sockets) = control_sockets.lock() {
-                if let Some(entry) = sockets.get_mut(serial) {
-                    entry.video_width = video_width;
-                    entry.video_height = video_height;
-                    println!(
-                        "[SCRCPY-FWD] updated control socket video size serial={} {}x{}",
-                        serial, video_width, video_height
-                    );
-                }
+            // 3.x carries the video size here; 4.x sends it as a session-meta
+            // record in the stream below instead.
+            if !wire.inline_session_meta {
+                video_width = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                video_height = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                publish_video_size(control_sockets, serial, video_width, video_height);
             }
-            buf.drain(..12);
+            println!(
+                "[SCRCPY-FWD] codec meta serial={} codec={} w={} h={} header_len={}",
+                serial, fourcc, video_width, video_height, wire.header_len
+            );
+            buf.drain(..wire.header_len);
             codec_meta_consumed = true;
         }
 
@@ -655,8 +672,26 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             continue;
         }
 
-        while buf.len() >= 12 {
+        while buf.len() >= FRAME_HEADER_LEN {
             let pts_raw = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+
+            // scrcpy 4.x interleaves 12-byte session-meta records, flagged by
+            // bit 63, whenever the encoder (re)starts — including on rotation.
+            // They carry no payload, so they must be consumed before the
+            // remaining bits are read as a frame header.
+            if wire.inline_session_meta && pts_raw & (1 << 63) != 0 {
+                video_width = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                video_height = u32::from_be_bytes(buf[8..SESSION_META_LEN].try_into().unwrap());
+                println!(
+                    "[SCRCPY-FWD] session meta serial={} w={} h={}",
+                    serial, video_width, video_height
+                );
+                publish_video_size(control_sockets, serial, video_width, video_height);
+                buf.drain(..SESSION_META_LEN);
+                invalid_header_hits = 0;
+                continue;
+            }
+
             let packet_size = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
             if packet_size == 0 {
                 buf.drain(..12);
@@ -687,9 +722,9 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 break;
             }
 
-            let is_config = (pts_raw >> 63) & 1 == 1;
-            let is_key = (pts_raw >> 62) & 1 == 1;
-            let pts = pts_raw & 0x3FFF_FFFF_FFFF_FFFF;
+            let is_config = pts_raw & wire.config_mask != 0;
+            let is_key = pts_raw & wire.key_mask != 0;
+            let pts = pts_raw & wire.pts_mask;
 
             let nal_data = &buf[12..12 + packet_size];
 

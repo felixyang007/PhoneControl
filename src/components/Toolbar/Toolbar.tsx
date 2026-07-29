@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react';
+import { open } from '@tauri-apps/plugin-dialog';
 import { useAdbCommands } from '../../hooks/useAdbCommands';
 import { useStore } from '../../store';
 import type { CommandResult } from '../../types';
@@ -18,6 +19,8 @@ export function Toolbar() {
   const [text, setText] = useState('');
   const [shellCmd, setShellCmd] = useState('');
   const [shellResults, setShellResults] = useState<CommandResult[] | null>(null);
+  const [resultsTitle, setResultsTitle] = useState('Output');
+  const [installing, setInstalling] = useState(false);
   const shellHistoryRef = useRef<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const savedInputRef = useRef('');
@@ -41,8 +44,32 @@ export function Toolbar() {
     setHistoryIndex(-1);
     savedInputRef.current = '';
     const results = await cmds.runShell(shellCmd);
+    setResultsTitle('Shell Output');
     setShellResults(results);
     setShellCmd('');
+  }
+
+  // Host-side `adb install`. Kept separate from the Shell tab on purpose:
+  // Shell sends device-side commands (pm/input/wm), this runs a host adb
+  // command (install/forward/connect) — mixing the two is a classic footgun.
+  async function installApk() {
+    if (selectedCount === 0 || installing) return;
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: 'Android package', extensions: ['apk'] }],
+    });
+    if (typeof selected !== 'string') return; // cancelled
+    setInstalling(true);
+    setResultsTitle('Install APK');
+    setShellResults(null);
+    try {
+      const results = await cmds.installApk(selected);
+      setShellResults(results);
+    } catch (e) {
+      setShellResults([{ serial: '(host)', success: false, message: String(e) }]);
+    } finally {
+      setInstalling(false);
+    }
   }
 
   async function setUsbFileTransfer() {
@@ -64,6 +91,7 @@ export function Toolbar() {
       }
 
       const results = await cmds.setUsbFileTransfer();
+      setResultsTitle('MTP');
       setShellResults(results);
     } finally {
       if (activeStreams.length > 0) {
@@ -120,7 +148,7 @@ export function Toolbar() {
       {shellResults && (
         <div className={styles.shellResults}>
           <div className={styles.shellResultsHeader}>
-            <span>Shell Output ({shellResults.length} devices)</span>
+            <span>{resultsTitle} ({shellResults.length} devices)</span>
             <button className={styles.shellCloseBtn} onClick={() => setShellResults(null)}>x</button>
           </div>
           <div className={styles.shellResultsList}>
@@ -160,6 +188,14 @@ export function Toolbar() {
             disabled={selectedCount === 0 || groupInputBusy}
           >
             MTP
+          </button>
+          <button
+            className={`${styles.keyBtn} ${styles.keyBtnWide}`}
+            title="Install an .apk on all selected devices (host-side adb install -r)"
+            onClick={installApk}
+            disabled={selectedCount === 0 || installing}
+          >
+            {installing ? 'Installing…' : 'Install APK'}
           </button>
         </div>
 

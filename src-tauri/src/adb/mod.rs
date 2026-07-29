@@ -1,3 +1,4 @@
+pub mod binaries;
 pub mod commands;
 pub mod device;
 pub mod scrcpy_client;

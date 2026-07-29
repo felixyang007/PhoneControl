@@ -835,8 +835,12 @@ async fn launch_scrcpy(
 ) -> Result<(), String> {
     let is_remote = !(server_host == "127.0.0.1" || server_host == "localhost");
     tauri::async_runtime::spawn(async move {
-        let mut cmd = tokio::process::Command::new("scrcpy");
+        let mut cmd = tokio::process::Command::new(adb::binaries::scrcpy());
         cmd.args(["-s", &serial]);
+        // scrcpy runs its own `adb` lookup against PATH. A bundled .app has no
+        // Homebrew on PATH, so hand it the path we already resolved — scrcpy
+        // reads the ADB env var for exactly this.
+        cmd.env("ADB", adb::binaries::adb());
         if is_remote {
             cmd.env(
                 "ADB_SERVER_SOCKET",
@@ -874,7 +878,9 @@ async fn run_shell_devices(
                 let mut args = server_args(&d.server_host, d.server_port);
                 args.extend(["-s".into(), d.serial.clone(), "shell".into()]);
                 args.extend(cmd.split_whitespace().map(String::from));
-                let out = std::process::Command::new("adb").args(&args).output();
+                let out = std::process::Command::new(adb::binaries::adb())
+                    .args(&args)
+                    .output();
                 match out {
                     Ok(o) => CommandResult {
                         serial: d.serial.clone(),
@@ -891,6 +897,89 @@ async fn run_shell_devices(
             })
         })
         .collect();
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        results.push(h.await.map_err(|e| e.to_string())?);
+    }
+    Ok(results)
+}
+
+// ── Install APK (host-side adb) ───────────────────────────────────────────────
+
+/// Host-side `adb install -r <apk>` broadcast to every selected device.
+///
+/// This is deliberately NOT a device shell command: it runs `adb install` on
+/// the host, which installs as the adb user and so bypasses the "unknown
+/// sources" prompt that plagues device-side `pm install`. Installs are gated by
+/// `adb_semaphore` (one permit each) because pushing a full APK is far heavier
+/// than a tap — a large fleet installing at once would swamp the adb server.
+#[tauri::command]
+async fn install_apk_devices(
+    serials: Vec<DeviceResolution>,
+    apk_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CommandResult>, String> {
+    use adb::device::server_args;
+
+    // Fail fast with one clear error instead of N identical adb failures.
+    if !std::path::Path::new(&apk_path).is_file() {
+        return Err(format!("APK not found: {apk_path}"));
+    }
+
+    let sem = Arc::clone(&state.adb_semaphore);
+    let handles: Vec<_> = serials
+        .into_iter()
+        .map(|d| {
+            let apk_path = apk_path.clone();
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                // Bound concurrent installs to the global ADB budget.
+                let _permit = sem.acquire_owned().await;
+                let serial = d.serial.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut args = server_args(&d.server_host, d.server_port);
+                    args.extend([
+                        "-s".into(),
+                        d.serial.clone(),
+                        "install".into(),
+                        "-r".into(),
+                        apk_path,
+                    ]);
+                    let out = std::process::Command::new(adb::binaries::adb())
+                        .args(&args)
+                        .output();
+                    match out {
+                        Ok(o) => {
+                            let text = String::from_utf8_lossy(&o.stdout).to_string()
+                                + &String::from_utf8_lossy(&o.stderr);
+                            // `adb install` can exit 0 while the device reports
+                            // `Failure [...]`, so inspect the output too.
+                            let success = o.status.success()
+                                && !text.contains("Failure")
+                                && !text.contains("Error");
+                            CommandResult {
+                                serial: d.serial.clone(),
+                                success,
+                                message: text.trim().to_string(),
+                            }
+                        }
+                        Err(e) => CommandResult {
+                            serial: d.serial.clone(),
+                            success: false,
+                            message: e.to_string(),
+                        },
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| CommandResult {
+                    serial,
+                    success: false,
+                    message: format!("install task failed: {e}"),
+                })
+            })
+        })
+        .collect();
+
     let mut results = Vec::with_capacity(handles.len());
     for h in handles {
         results.push(h.await.map_err(|e| e.to_string())?);
@@ -932,6 +1021,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .manage(ws_hub)
         .invoke_handler(tauri::generate_handler![
@@ -951,6 +1041,7 @@ pub fn run() {
             wake_up_devices,
             launch_scrcpy,
             run_shell_devices,
+            install_apk_devices,
             load_config,
             refresh_devices,
         ])

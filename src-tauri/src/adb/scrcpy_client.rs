@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     io::{Read, Write},
     net::TcpStream,
     sync::{Mutex, OnceLock},
@@ -45,7 +44,14 @@ pub(crate) fn build_start_argv(
         format!("video_bit_rate={}", opts.bit_rate),
         "video_codec_options=i-frame-interval=1".into(),
         "send_device_meta=false".into(),
-        "send_codec_meta=true".into(),
+        // Renamed in scrcpy 4.0. Passing the wrong name is not an error — the
+        // server just logs "Unknown server option" and falls back to the
+        // default — so this has to be right rather than merely accepted.
+        if major_version_of(ver) >= 4 {
+            "send_stream_meta=true".into()
+        } else {
+            "send_codec_meta=true".into()
+        },
         "send_dummy_byte=true".into(),
         "send_frame_meta=true".into(),
     ]
@@ -84,8 +90,19 @@ pub(crate) fn forward_connect_addr(server_host: &str, local_port: u16) -> String
     format!("{server_host}:{local_port}")
 }
 
+/// Remote path for *our* copy of `scrcpy-server`.
+///
+/// Deliberately NOT `/data/local/tmp/scrcpy-server.jar`. The standalone scrcpy
+/// client pushes to that exact path and **deletes it when it exits**. Sharing
+/// the path means any scrcpy run — including this app's own "open in scrcpy"
+/// button — wipes the jar out from under the embedded preview. Every later
+/// `app_process` launch then aborts instantly with a missing CLASSPATH, and the
+/// device sits on "reconnecting" with a black canvas until the app is
+/// restarted. Owning a private filename makes the two independent.
+pub(crate) const REMOTE_SERVER_PATH: &str = "/data/local/tmp/phone-control-scrcpy-server.jar";
+
 fn scrcpy_version() -> Result<String, String> {
-    let out = std::process::Command::new("scrcpy")
+    let out = std::process::Command::new(super::binaries::scrcpy())
         .arg("--version")
         .output()
         .map_err(|e| format!("failed to run scrcpy --version: {e}"))?;
@@ -107,13 +124,32 @@ fn scrcpy_server_installed_path() -> Result<String, String> {
         return Ok(p);
     }
 
-    let candidates = [
-        "/usr/local/opt/scrcpy/share/scrcpy/scrcpy-server",
-        "/opt/homebrew/opt/scrcpy/share/scrcpy/scrcpy-server",
-    ];
-    for p in candidates {
-        if std::path::Path::new(p).exists() {
-            return Ok(p.to_string());
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Derive from wherever the scrcpy binary actually lives: every packager
+    // installs the server at `<prefix>/share/scrcpy/scrcpy-server` alongside
+    // `<prefix>/bin/scrcpy`. This covers Homebrew on either architecture, and
+    // any other prefix, without hardcoding it. `parent().parent()` is None for
+    // a bare "scrcpy" fallback, so this is skipped when lookup failed.
+    let bin = super::binaries::scrcpy();
+    for base in [Some(bin.clone()), std::fs::canonicalize(&bin).ok()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(prefix) = base.parent().and_then(|p| p.parent()) {
+            candidates.push(prefix.join("share/scrcpy/scrcpy-server"));
+        }
+    }
+
+    // Homebrew's versioned `opt` symlinks, kept as a fallback.
+    candidates.push("/opt/homebrew/opt/scrcpy/share/scrcpy/scrcpy-server".into());
+    candidates.push("/usr/local/opt/scrcpy/share/scrcpy/scrcpy-server".into());
+    candidates.push("/usr/share/scrcpy/scrcpy-server".into());
+    candidates.push("/usr/local/share/scrcpy/scrcpy-server".into());
+
+    for p in &candidates {
+        if p.is_file() {
+            return Ok(p.to_string_lossy().into_owned());
         }
     }
 
@@ -127,71 +163,143 @@ struct ScrcpyRuntimeInfo {
     server_size: u64,
 }
 
-static SCRCPY_RUNTIME_INFO: OnceLock<Result<ScrcpyRuntimeInfo, String>> = OnceLock::new();
+/// Caches only a *successful* probe.
+///
+/// This used to be a `OnceLock<Result<_, String>>`, which cached the `Err` too:
+/// if scrcpy was missing when the first device connected, every later attempt
+/// replayed that stale failure for the lifetime of the process, so installing
+/// scrcpy required restarting the app and the UI just span on
+/// "Stream: reconnecting" forever. Holding the lock across the probe is
+/// intentional — it keeps N devices connecting at once from each spawning their
+/// own `scrcpy --version`.
+static SCRCPY_RUNTIME_INFO: OnceLock<Mutex<Option<ScrcpyRuntimeInfo>>> = OnceLock::new();
+
+fn probe_scrcpy_runtime() -> Result<ScrcpyRuntimeInfo, String> {
+    let version = scrcpy_version()?;
+    let server_path = scrcpy_server_installed_path()?;
+    let server_size = std::fs::metadata(&server_path)
+        .map_err(|e| format!("scrcpy-server metadata failed: {e}"))?
+        .len();
+    if server_size == 0 {
+        return Err("scrcpy-server file is empty".into());
+    }
+    Ok(ScrcpyRuntimeInfo {
+        version,
+        server_path,
+        server_size,
+    })
+}
 
 fn scrcpy_runtime_info() -> Result<ScrcpyRuntimeInfo, String> {
-    SCRCPY_RUNTIME_INFO
-        .get_or_init(|| {
-            let version = scrcpy_version()?;
-            let server_path = scrcpy_server_installed_path()?;
-            let server_size = std::fs::metadata(&server_path)
-                .map_err(|e| format!("scrcpy-server metadata failed: {e}"))?
-                .len();
-            if server_size == 0 {
-                return Err("scrcpy-server file is empty".into());
-            }
-            println!(
-                "[SCRCPY] runtime cached ver={} server={} size={}",
-                version, server_path, server_size
-            );
-            Ok(ScrcpyRuntimeInfo {
-                version,
-                server_path,
-                server_size,
-            })
-        })
-        .clone()
+    let cell = SCRCPY_RUNTIME_INFO.get_or_init(|| Mutex::new(None));
+    let mut cached = match cell.lock() {
+        Ok(guard) => guard,
+        // A panic while probing must not wedge streaming permanently.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(info) = cached.as_ref() {
+        return Ok(info.clone());
+    }
+
+    let info = probe_scrcpy_runtime()?;
+    println!(
+        "[SCRCPY] runtime cached ver={} server={} size={}",
+        info.version, info.server_path, info.server_size
+    );
+    *cached = Some(info.clone());
+    Ok(info)
+}
+
+/// Layout of the scrcpy video socket, which changed incompatibly in 4.0.
+///
+/// Decoded from `Streamer`/`SurfaceEncoder` in the scrcpy 4.1 server dex, since
+/// the wire format is not documented anywhere:
+///
+/// ```text
+/// 3.x   [dummy 1] [codec_id 4 | width 4 | height 4]  then frames only
+/// 4.x   [dummy 1] [codec_id 4]                       then frames + session meta
+/// ```
+///
+/// In 4.x the video size is no longer a one-off header. `writeVideoHeader()`
+/// emits just the codec id, and `writeSessionMeta(w, h, flag)` emits a 12-byte
+/// record — `0x8000_000{0,1} | width | height`, no payload — before every
+/// encoding session, i.e. again on each rotation or size change. Bit 63 of the
+/// record's first 8 bytes is what distinguishes it from a frame header, which
+/// is why the frame flags had to move down a bit:
+///
+/// ```text
+/// 3.x   bit 63 = config,        bit 62 = keyframe,  pts = low 62 bits
+/// 4.x   bit 63 = session meta,  bit 62 = config,    bit 61 = keyframe,
+///                                                   pts = low 61 bits
+/// ```
+///
+/// Reading a 4.x stream with 3.x flags is silently wrong rather than a clean
+/// error: config packets (pts word `0x4000…`) look like keyframes and real
+/// keyframes (`0x2000…`) look like deltas. The browser then configures its
+/// decoder from a config packet mislabelled as a key chunk and waits forever
+/// for a keyframe that never arrives — the stream reports "receiving" while the
+/// canvas stays black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoWireFormat {
+    /// Bytes of one-off header following the dummy byte. Always starts with the
+    /// 4-byte codec id; on 3.x it also carries width and height.
+    pub header_len: usize,
+    /// Whether width/height arrive as inline session-meta records instead.
+    pub inline_session_meta: bool,
+    pub config_mask: u64,
+    pub key_mask: u64,
+    pub pts_mask: u64,
+}
+
+/// Length of a session-meta record: `flags(4) + width(4) + height(4)`. Sized to
+/// match a frame header so a reader can classify one before consuming it.
+pub const SESSION_META_LEN: usize = 12;
+
+/// Marks a session-meta record; also the frame header length, since scrcpy
+/// deliberately made the two the same size.
+pub const FRAME_HEADER_LEN: usize = 12;
+
+pub fn video_wire_format(major_version: u32) -> VideoWireFormat {
+    if major_version >= 4 {
+        VideoWireFormat {
+            header_len: 4,
+            inline_session_meta: true,
+            config_mask: 1 << 62,
+            key_mask: 1 << 61,
+            pts_mask: (1 << 61) - 1,
+        }
+    } else {
+        VideoWireFormat {
+            header_len: 12,
+            inline_session_meta: false,
+            config_mask: 1 << 63,
+            key_mask: 1 << 62,
+            pts_mask: (1 << 62) - 1,
+        }
+    }
+}
+
+/// Major version from a scrcpy version string like `4.1` or `3.2.1`.
+/// Falls back to 3 (the historical layout) if it cannot be determined.
+pub fn major_version_of(ver: &str) -> u32 {
+    ver.split('.')
+        .next()
+        .and_then(|m| m.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+}
+
+/// Major version of the local scrcpy, used to pick the wire layout.
+pub fn scrcpy_major_version() -> u32 {
+    scrcpy_runtime_info()
+        .ok()
+        .map(|info| major_version_of(&info.version))
+        .unwrap_or(3)
 }
 
 fn parse_first_u64(s: &str) -> Option<u64> {
     s.split(|c: char| !c.is_ascii_digit())
         .find(|part| !part.is_empty())
         .and_then(|part| part.parse().ok())
-}
-
-static VERIFIED_REMOTE_SERVERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn verified_remote_servers() -> &'static Mutex<HashSet<String>> {
-    VERIFIED_REMOTE_SERVERS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn remote_server_cache_key(
-    host: &str,
-    port: u16,
-    serial: &str,
-    remote_path: &str,
-    size: u64,
-) -> String {
-    format!("{host}:{port}:{serial}:{remote_path}:{size}")
-}
-
-fn mark_remote_server_verified(key: &str) {
-    if let Ok(mut cache) = verified_remote_servers().lock() {
-        cache.insert(key.to_string());
-    }
-}
-
-fn is_remote_server_verified(key: &str) -> bool {
-    verified_remote_servers()
-        .lock()
-        .map(|cache| cache.contains(key))
-        .unwrap_or(false)
-}
-
-fn clear_remote_server_verified(key: &str) {
-    if let Ok(mut cache) = verified_remote_servers().lock() {
-        cache.remove(key);
-    }
 }
 
 /// Minimal scrcpy bootstrapper.
@@ -209,7 +317,7 @@ pub struct ScrcpyConnection {
 fn run_adb(host: &str, port: u16, args: &[String]) -> Result<std::process::Output, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new("adb")
+    std::process::Command::new(super::binaries::adb())
         .args(&full)
         .output()
         .map_err(|e| format!("adb spawn failed: {e}"))
@@ -232,7 +340,7 @@ pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
 fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process::Child, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
-    std::process::Command::new("adb")
+    std::process::Command::new(super::binaries::adb())
         .args(&full)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -314,24 +422,20 @@ pub fn start_scrcpy_and_connect(
     let runtime = scrcpy_runtime_info()?;
     let ver = runtime.version;
 
-    // 1) Push server to device only if not already present (saves ~1s).
-    let remote_path = "/data/local/tmp/scrcpy-server.jar";
-    let remote_cache_key = remote_server_cache_key(
-        server_host,
-        server_port,
-        serial,
-        remote_path,
-        runtime.server_size,
-    );
+    // 1) Push server to device only if the copy there is missing or stale.
+    let remote_path = REMOTE_SERVER_PATH;
 
-    if is_remote_server_verified(&remote_cache_key) {
-        println!(
-            "[SCRCPY] server cache hit serial={} ver={} elapsed={}ms",
-            serial,
-            ver,
-            started_at.elapsed().as_millis()
-        );
-    } else {
+    // The size probe below runs on EVERY start, deliberately. It used to be
+    // skipped once a device was in `VERIFIED_REMOTE_SERVERS`, but "we pushed it
+    // once" is not the same as "it is still there": `/data/local/tmp` is
+    // cleared by a device reboot, by a wipe, and — observed on an Android 17
+    // emulator — by the platform itself roughly 45s after the push. Once the
+    // jar was gone, the cache meant we never looked again, so every reconnect
+    // launched `app_process` against a missing CLASSPATH, aborted instantly,
+    // and the device sat on "reconnecting" forever. One `stat` per start is
+    // ~30ms; the expensive part was always the push, which is still skipped
+    // when the sizes already match.
+    {
         let remote_size_str = adb_shell_check(
             server_host,
             server_port,
@@ -384,7 +488,6 @@ pub fn start_scrcpy_and_connect(
                 started_at.elapsed().as_millis()
             );
         }
-        mark_remote_server_verified(&remote_cache_key);
     }
 
     // 2) Start scrcpy server on device.
@@ -409,10 +512,7 @@ pub fn start_scrcpy_and_connect(
     // silence server stderr on some devices (PKG110 / OPPO).
     let mut argv: Vec<String> = vec!["-s".into(), serial.into(), "shell".into()];
     argv.extend(start_argv);
-    let mut server_child = run_adb_spawn(server_host, server_port, &argv).map_err(|e| {
-        clear_remote_server_verified(&remote_cache_key);
-        e
-    })?;
+    let mut server_child = run_adb_spawn(server_host, server_port, &argv)?;
 
     println!(
         "[SCRCPY] server started serial={} scid={:08x} elapsed={}ms (adb shell kept alive)",
@@ -451,7 +551,6 @@ pub fn start_scrcpy_and_connect(
     )?;
     if !out.status.success() {
         terminate_child(&mut server_child);
-        clear_remote_server_verified(&remote_cache_key);
         return Err(format!(
             "adb forward failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -514,7 +613,6 @@ pub fn start_scrcpy_and_connect(
             if start.elapsed() > Duration::from_secs(3) {
                 terminate_child(&mut server_child);
                 remove_forward(server_host, server_port, serial, actual_port);
-                clear_remote_server_verified(&remote_cache_key);
                 return Err(format!(
                     "tcp connect failed after retries: {}",
                     last_err.unwrap_or_else(|| "unknown".into())
@@ -590,13 +688,13 @@ mod tests {
             max_fps: 60,
             bit_rate: 8_000_000,
         };
-        let cmd = build_start_cmd("/data/local/tmp/scrcpy-server.jar", "3.2", 0xabcd, &opts);
+        let cmd = build_start_cmd(REMOTE_SERVER_PATH, "3.2", 0xabcd, &opts);
         assert!(cmd.contains("max_size=1080"), "cmd={cmd}");
         assert!(cmd.contains("max_fps=60"), "cmd={cmd}");
         assert!(cmd.contains("video_bit_rate=8000000"), "cmd={cmd}");
         assert!(cmd.contains("scid=0000abcd"), "cmd={cmd}");
         assert!(
-            cmd.contains("CLASSPATH=/data/local/tmp/scrcpy-server.jar"),
+            cmd.contains(&format!("CLASSPATH={REMOTE_SERVER_PATH}")),
             "cmd={cmd}"
         );
         assert!(
@@ -672,18 +770,101 @@ mod tests {
         assert_eq!(forward_connect_addr("localhost", 32250), "localhost:32250");
     }
 
+    /// Regression: scrcpy 4.0 shrank the video header to a bare codec id and
+    /// moved the video size into inline session-meta records.
+    #[test]
+    fn video_header_len_tracks_scrcpy_major() {
+        assert_eq!(video_wire_format(2).header_len, 12);
+        assert_eq!(video_wire_format(3).header_len, 12);
+        assert_eq!(video_wire_format(4).header_len, 4);
+        assert_eq!(video_wire_format(5).header_len, 4);
+
+        assert!(!video_wire_format(3).inline_session_meta);
+        assert!(video_wire_format(4).inline_session_meta);
+    }
+
+    /// The bug behind the black canvas: scrcpy 4.x gave bit 63 to session meta
+    /// and shifted the frame flags down one. Read with 3.x masks, a 4.x config
+    /// packet looks like a keyframe and a 4.x keyframe looks like a delta — so
+    /// the browser configures its decoder and then waits forever for a key
+    /// chunk that never comes.
+    #[test]
+    fn frame_flag_bits_shifted_in_scrcpy_4x() {
+        let v3 = video_wire_format(3);
+        assert_eq!(v3.config_mask, 0x8000_0000_0000_0000);
+        assert_eq!(v3.key_mask, 0x4000_0000_0000_0000);
+
+        let v4 = video_wire_format(4);
+        assert_eq!(v4.config_mask, 0x4000_0000_0000_0000);
+        assert_eq!(v4.key_mask, 0x2000_0000_0000_0000);
+
+        // Exactly what `Streamer.writeFrameMeta` emits on 4.x.
+        let config_hdr: u64 = 0x4000_0000_0000_0000;
+        let key_hdr: u64 = 0x2000_0000_0000_0000 | 123_456;
+        let delta_hdr: u64 = 123_999;
+
+        assert!(config_hdr & v4.config_mask != 0);
+        assert!(key_hdr & v4.config_mask == 0 && key_hdr & v4.key_mask != 0);
+        assert!(delta_hdr & v4.config_mask == 0 && delta_hdr & v4.key_mask == 0);
+        assert_eq!(key_hdr & v4.pts_mask, 123_456);
+
+        // Session meta must not be mistaken for any of them.
+        assert!(0x8000_0000_u64 << 32 & v4.config_mask == 0);
+
+        // The pre-fix misread, kept as documentation.
+        assert!(
+            config_hdr & v3.key_mask != 0,
+            "config looked like a keyframe"
+        );
+        assert!(key_hdr & v3.key_mask == 0, "keyframe looked like a delta");
+    }
+
+    /// Byte-exact check against a real scrcpy 4.1 stream from a 1080x2400
+    /// device at `max_size=480`: dummy byte, "h264", then a session-meta record
+    /// carrying 216x480.
+    #[test]
+    fn scrcpy_4x_header_then_session_meta_match_capture() {
+        let captured: [u8; 17] = [
+            0x00, // dummy byte
+            0x68, 0x32, 0x36, 0x34, // video header: "h264" — and nothing else
+            0x80, 0x00, 0x00, 0x00, // session meta: 0x80000000 marker + flag
+            0x00, 0x00, 0x00, 0xd8, // width  = 216
+            0x00, 0x00, 0x01, 0xe0, // height = 480
+        ];
+        let wire = video_wire_format(4);
+        let after_dummy = &captured[1..];
+        let meta = &after_dummy[wire.header_len..];
+        assert_eq!(meta.len(), SESSION_META_LEN);
+
+        // A reader sees the first 8 bytes as a frame header's pts word first.
+        let as_frame_header = u64::from_be_bytes(meta[0..8].try_into().unwrap());
+        assert!(
+            as_frame_header & (1 << 63) != 0,
+            "must be tagged as session meta"
+        );
+        assert_eq!(u32::from_be_bytes(meta[4..8].try_into().unwrap()), 216);
+        assert_eq!(u32::from_be_bytes(meta[8..12].try_into().unwrap()), 480);
+    }
+
+    /// Regression: the embedded preview went permanently black whenever a
+    /// standalone scrcpy ran, because scrcpy deletes its own pushed server on
+    /// exit and we were pushing to the same filename.
+    #[test]
+    fn remote_server_path_does_not_collide_with_scrcpy() {
+        assert_ne!(
+            REMOTE_SERVER_PATH, "/data/local/tmp/scrcpy-server.jar",
+            "standalone scrcpy deletes this path on exit; we must own a private one"
+        );
+        assert!(REMOTE_SERVER_PATH.starts_with("/data/local/tmp/"));
+    }
+
     #[test]
     fn build_start_argv_is_individual_tokens() {
         // scrcpy CLI uses individual argv tokens — NOT `sh -c "..."`. The
         // sh -c wrapper was observed to swallow server stderr on OPPO PKG110.
         // Each argument must stand alone so `adb shell` gets them as separate
         // args, the way the CLI does.
-        let argv = build_start_argv(
-            "/data/local/tmp/scrcpy-server.jar",
-            "3.2",
-            0xabcd,
-            &StreamOptions::default(),
-        );
+        let argv = build_start_argv(REMOTE_SERVER_PATH, "3.2", 0xabcd, &StreamOptions::default());
 
         // Must NOT contain spaces in any single token (would indicate a joined blob).
         // Note: some scrcpy key=value args legitimately contain multiple '=' signs
@@ -696,7 +877,7 @@ mod tests {
         }
 
         // Required tokens, in argv form.
-        assert_eq!(argv[0], "CLASSPATH=/data/local/tmp/scrcpy-server.jar");
+        assert_eq!(argv[0], format!("CLASSPATH={REMOTE_SERVER_PATH}"));
         assert_eq!(argv[1], "app_process");
         assert_eq!(argv[2], "/");
         assert_eq!(argv[3], "com.genymobile.scrcpy.Server");

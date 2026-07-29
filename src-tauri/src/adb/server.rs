@@ -39,7 +39,7 @@ impl AdbServer {
 }
 
 fn run_adb_timeout(args: &[String], timeout_secs: u64) -> String {
-    let mut child = match Command::new("adb")
+    let mut child = match Command::new(super::binaries::adb())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

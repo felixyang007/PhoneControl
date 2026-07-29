@@ -32,7 +32,7 @@ struct AdbOutput {
 }
 
 fn run_adb_once(args: &[String], timeout: Duration) -> Result<AdbOutput, String> {
-    let mut child = Command::new("adb")
+    let mut child = Command::new(super::binaries::adb())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -476,7 +476,10 @@ pub fn wake_up_device(host: &str, port: u16, serial: &str) -> CommandResult {
         "power".into(),
     ]);
 
-    let out = match Command::new("adb").args(&check_args).output() {
+    let out = match Command::new(super::binaries::adb())
+        .args(&check_args)
+        .output()
+    {
         Ok(out) => out,
         Err(e) => {
             return CommandResult {
