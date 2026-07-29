@@ -251,13 +251,13 @@ pub struct VideoWireFormat {
     pub pts_mask: u64,
 }
 
-/// Length of a session-meta record: `flags(4) + width(4) + height(4)`. Sized to
-/// match a frame header so a reader can classify one before consuming it.
-pub const SESSION_META_LEN: usize = 12;
-
-/// Marks a session-meta record; also the frame header length, since scrcpy
-/// deliberately made the two the same size.
+/// Frame header: `pts_with_flags(8) + packet_size(4)`, followed by the payload.
 pub const FRAME_HEADER_LEN: usize = 12;
+
+/// Session-meta record: `flags(4) + width(4) + height(4)`, with no payload.
+/// Deliberately the same length as a frame header, so a reader can buffer one
+/// header's worth of bytes and only then decide which of the two it is holding.
+pub const SESSION_META_LEN: usize = FRAME_HEADER_LEN;
 
 pub fn video_wire_format(major_version: u32) -> VideoWireFormat {
     if major_version >= 4 {
