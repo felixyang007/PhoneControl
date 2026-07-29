@@ -1,0 +1,45 @@
+# P0 smoke template for the product app — copy per app and fill in the TODOs.
+# Pass the package via env: `maestro test --env APP_ID=ai.plaud.app app-smoke.yaml`.
+#
+# Covers the report's P0 set: install/launch/no-crash, permission dialogs,
+# home/nav, one core business loop, login. Keep it under ~10 min — smoke, not
+# regression. Delete steps that don't apply.
+appId: ${APP_ID}
+---
+# 1) Cold start, no crash / white screen. Auto-grant runtime permissions so the
+#    location/camera/notification dialogs don't block the run.
+- launchApp:
+    clearState: true
+    permissions:
+      all: allow
+- takeScreenshot: 01-cold-start
+
+# 2) Basic perception — the first meaningful screen rendered.
+#    TODO: assert something stable on your first screen (a logo, a tab, a title).
+# - assertVisible: "Home"
+
+# 3) Login / auth (guest or account). TODO: adjust selectors.
+# - tapOn: "Continue as guest"
+#   # or:
+# - tapOn: { id: "email_input" }
+# - inputText: "${LOGIN_USER}"
+# - tapOn: { id: "password_input" }
+# - inputText: "${LOGIN_PASS}"
+# - tapOn: "Log in"
+# - assertVisible: "Home"
+
+# 4) Home & navigation — core tabs load.
+# - tapOn: "Discover"
+# - assertVisible: "Discover"
+# - tapOn: "Me"
+# - assertVisible: "Me"
+
+# 5) One core business loop (e.g. search -> detail, or open -> play).
+# - tapOn: { id: "search" }
+# - inputText: "hello"
+# - pressKey: Enter
+# - assertVisible: "Results"
+# - tapOn: { index: 0, id: "result_item" }
+# - assertVisible: "Detail"
+
+- takeScreenshot: 99-final

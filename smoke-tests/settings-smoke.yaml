@@ -1,0 +1,12 @@
+# Runnable-anywhere demo smoke flow — targets the Android Settings app, which
+# exists on every device/emulator. Use it to validate the pipeline end-to-end
+# without the product APK. Locale-independent (no text assertions): launchApp
+# fails if the app can't start, which is the core "no crash / no black screen"
+# smoke signal; the screenshot proves the UI actually rendered.
+appId: com.android.settings
+---
+- launchApp:
+    clearState: false
+- takeScreenshot: settings-home
+- assertVisible:
+    id: "android:id/.*"   # some view from the app is on screen
