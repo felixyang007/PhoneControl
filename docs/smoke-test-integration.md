@@ -221,8 +221,9 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
 - [ ] 飞书/钉钉机器人推送（编排层）
 
 ### Phase 3 — AI 诊断与 Linear 联动（编排层，不进 App）
-- [ ] 失败时把 logcat + 截图喂给 Claude 做根因分类（崩溃 / 环境 / 用例失效）
-- [ ] 经 Linear MCP 自动建单，挂载日志/录屏/AI 分析
+- [x] **失败时 AI 根因分类** —— [`smoke-tests/smoke-triage.sh`](../smoke-tests/smoke-triage.sh) 读 manifest → 从 logcat 抽崩溃/网络信号 → `claude -p` 分类 [A]崩溃 / [B]环境 / [C]用例失效（heuristic 先分一遍，LLM 精修）。`smoke-run.sh --triage` 在失败时自动触发。
+- [x] **经 Linear MCP 自动建单** —— `--triage-create` / `smoke-triage.sh --create`：仅对 [A] 建单，附 AI 分析 + mp4/logcat 路径 + Android 标签。需在 CI 机器上配好 Linear MCP。
+- 说明：整层跑在 CI，**不进 App**（凭据/集成不该进 GUI）。manifest 是唯一桥梁——AI 只读这个 JSON 就能定位日志/录屏。
 
 ## 6. 决策记录（原开放问题已定）
 

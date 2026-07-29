@@ -19,18 +19,20 @@ set -uo pipefail
 API="${SMOKE_API:-http://127.0.0.1:9090}"
 TOKEN="${PHONE_CONTROL_TOKEN:-$(cat "$HOME/.phone_control/api_token" 2>/dev/null || true)}"
 TASK="smoke-$$-$(date +%s)"
-FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR=""
+FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE=""
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --flow)       FLOW="$2"; shift 2;;
-    --apk)        APK="$2"; shift 2;;
-    --serial)     SERIAL="$2"; shift 2;;
-    --task)       TASK="$2"; shift 2;;
-    --output-dir) OUTPUT_DIR="$2"; shift 2;;
-    --api)        API="$2"; shift 2;;
-    -h|--help)    sed -n '2,20p' "$0"; exit 0;;
+    --flow)          FLOW="$2"; shift 2;;
+    --apk)           APK="$2"; shift 2;;
+    --serial)        SERIAL="$2"; shift 2;;
+    --task)          TASK="$2"; shift 2;;
+    --output-dir)    OUTPUT_DIR="$2"; shift 2;;
+    --api)           API="$2"; shift 2;;
+    --triage)        TRIAGE="dry-run"; shift;;   # AI root-cause on failure
+    --triage-create) TRIAGE="create"; shift;;    # …and file a Linear bug
+    -h|--help)       sed -n '2,20p' "$0"; exit 0;;
     *) die "unknown arg: $1";;
   esac
 done
@@ -62,6 +64,17 @@ finalize() {
     api "$API/api/v1/smoke/report?task_id=$TASK&exit_code=$MAESTRO_RC" || true; echo
   fi
   api -X POST "$API/api/v1/devices/release" -d "$(printf '{"task_id":"%s"}' "$TASK")" >/dev/null 2>&1 || true
+
+  # Phase 3: on failure, hand the manifest to the AI triage / Linear orchestrator.
+  if [[ -n "$TRIAGE" && "$MAESTRO_RC" != "0" && "$CAPTURE_STARTED" == "1" ]]; then
+    local dir="${OUTPUT_DIR:-$HOME/.phone_control/recordings}"
+    local manifest="$dir/$TASK-manifest.json"
+    if [[ -f "$manifest" ]]; then
+      echo "▸ triage ($TRIAGE):"
+      "$(dirname "$0")/smoke-triage.sh" --manifest "$manifest" $( [[ "$TRIAGE" == "create" ]] && echo --create ) || true
+    fi
+  fi
+
   echo "▸ done · exit=$MAESTRO_RC"
   exit "$MAESTRO_RC"
 }

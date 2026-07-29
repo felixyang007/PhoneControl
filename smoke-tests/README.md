@@ -9,7 +9,8 @@ capture (mp4 + logcat); **Maestro** drives the UI. The orchestrator glues them.
 ## Files
 - `settings-smoke.yaml` — runnable-anywhere demo flow (targets `com.android.settings`); use it to validate the pipeline without the product APK.
 - `app-smoke.template.yaml` — P0 template for the product app; copy, fill TODOs, pass `--env APP_ID=...`.
-- `smoke-run.sh` — orchestrator: acquire → [install] → capture/start → `maestro test` → capture/stop → report → release. Exit code is Maestro's.
+- `smoke-run.sh` — orchestrator: acquire → [install] → capture/start → `maestro test` → capture/stop → report → release. Exit code is Maestro's. `--triage` runs AI root-cause on failure; `--triage-create` also files a Linear bug.
+- `smoke-triage.sh` + `triage-prompt.md` — Phase 3: on a failed run, extract crash/network signals from the logcat and ask Claude to classify (A crash / B env / C flaky-UI); with `--create`, file a Linear bug (class [A] only) via the Linear MCP. Runs in CI, not in the app.
 
 ## Prerequisites
 - phone-control running (control API on `127.0.0.1:9090`); token at `~/.phone_control/api_token`.
