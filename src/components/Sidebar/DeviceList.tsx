@@ -18,6 +18,7 @@ export function DeviceList() {
   const toggleDisableDevice = useStore((s) => s.toggleDisableDevice);
   const selectAll = useStore((s) => s.selectAll);
   const clearSelection = useStore((s) => s.clearSelection);
+  const leasedSerials = useStore((s) => s.leasedSerials);
   const [filter, setFilter] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -108,7 +109,12 @@ export function DeviceList() {
                 style={{ cursor: 'pointer' }}
               />
               <div className={styles.info}>
-                <div className={styles.name}>{d.serial}</div>
+                <div className={styles.name}>
+                  {d.serial}
+                  {leasedSerials[d.serial] && (
+                    <span className={styles.autoTag} title={`CI 自动化测试中 · task=${leasedSerials[d.serial]}`}>AUTO</span>
+                  )}
+                </div>
                 <div className={styles.meta}>
                   {disabledSerials.has(d.serial) ? 'Disabled' : STATUS_LABEL[d.status]}
                 </div>

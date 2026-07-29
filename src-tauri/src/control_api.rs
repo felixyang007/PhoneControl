@@ -111,6 +111,14 @@ pub struct Lease {
     pub expires_at: u64,
 }
 
+/// Lease registry, keyed by serial. Shared (via Tauri managed state) with the
+/// UI so the device grid can badge devices a CI task is driving.
+pub type Leases = Arc<StdMutex<HashMap<String, Lease>>>;
+
+pub fn new_leases() -> Leases {
+    Arc::new(StdMutex::new(HashMap::new()))
+}
+
 /// One device's artifacts from a smoke run (what `/smoke/report` returns).
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceArtifact {
@@ -133,7 +141,7 @@ pub struct ControlApiState {
     pub adb_semaphore: Arc<Semaphore>,
     pub stream_tokens: StreamTokens,
     pub control_sockets: ControlSockets,
-    pub leases: Arc<StdMutex<HashMap<String, Lease>>>,
+    pub leases: Leases,
     /// Bearer token required on every endpoint except `/health`.
     pub token: String,
     /// Active recordings, keyed by serial (shared with the scrcpy receive loop).
@@ -154,6 +162,7 @@ impl ControlApiState {
         control_sockets: ControlSockets,
         token: String,
         recorders: crate::recording::Recorders,
+        leases: Leases,
         app: AppHandle,
     ) -> Self {
         Self {
@@ -161,7 +170,7 @@ impl ControlApiState {
             adb_semaphore,
             stream_tokens,
             control_sockets,
-            leases: Arc::new(StdMutex::new(HashMap::new())),
+            leases,
             token,
             recorders,
             captures: Arc::new(StdMutex::new(HashMap::new())),

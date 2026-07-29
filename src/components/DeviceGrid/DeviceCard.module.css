@@ -52,6 +52,40 @@
   color: var(--text-secondary);
 }
 
+/* CI automation badge — device is leased to a smoke task, don't hand-drive it */
+.autoBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: #ffb454;
+  background: rgba(240, 168, 80, 0.16);
+  border: 1px solid rgba(240, 168, 80, 0.5);
+  white-space: nowrap;
+}
+.autoBadge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #ffb454;
+  animation: autoPulse 1.4s ease-in-out infinite;
+}
+@keyframes autoPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .autoBadge::before { animation: none; }
+}
+.cardAuto {
+  box-shadow: 0 0 0 1.5px rgba(240, 168, 80, 0.7);
+}
+
 .screen {
   flex: 1;
   min-height: 0;

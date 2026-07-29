@@ -18,6 +18,7 @@ function DeviceCardInner({ device, selected }: Props) {
   const setGroupInputBusy = useStore((s) => s.setGroupInputBusy);
   const frame = useStore((s) => s.streamFrames[device.serial]);
   const status = useStore((s) => s.streamStatus[device.serial]);
+  const leasedTask = useStore((s) => s.leasedSerials[device.serial]);
   const cmds = useAdbCommands();
   const imgRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -231,11 +232,16 @@ function DeviceCardInner({ device, selected }: Props) {
       : device.status;
 
   return (
-    <div className={`${styles.card} ${selected ? styles.cardSelected : ''}`}>
+    <div className={`${styles.card} ${selected ? styles.cardSelected : ''} ${leasedTask ? styles.cardAuto : ''}`}>
       {/* Header */}
       <div className={styles.header} onClick={handleSelect}>
         <div className={`${styles.statusDot} ${statusClass}`} />
         <span className={styles.name}>{device.model || device.serial}</span>
+        {leasedTask && (
+          <span className={styles.autoBadge} title={`CI 自动化测试中 · task=${leasedTask}（勿手动操作）`}>
+            AUTO
+          </span>
+        )}
         {device.battery >= 0 && (
           <span className={styles.battery}>{device.battery}%</span>
         )}

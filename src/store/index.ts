@@ -39,6 +39,10 @@ interface AppStore {
   groupInputBusy: boolean;
   setGroupInputBusy: (busy: boolean) => void;
 
+  // CI lease state — serial → task_id of the automation driving it
+  leasedSerials: Record<string, string>;
+  setLeasedSerials: (m: Record<string, string>) => void;
+
   // FPS
   fps: number;
   setFps: (fps: number) => void;
@@ -113,6 +117,9 @@ export const useStore = create<AppStore>((set) => ({
 
   groupInputBusy: false,
   setGroupInputBusy: (busy) => set({ groupInputBusy: busy }),
+
+  leasedSerials: {},
+  setLeasedSerials: (m) => set({ leasedSerials: m }),
 
   fps: 10,
   setFps: (fps) => set({ fps }),

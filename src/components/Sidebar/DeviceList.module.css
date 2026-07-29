@@ -120,3 +120,17 @@
   background: rgba(74, 158, 255, 0.3);
   border-color: var(--accent);
 }
+
+/* CI automation tag in the sidebar row */
+.autoTag {
+  margin-left: 6px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: #ffb454;
+  background: rgba(240, 168, 80, 0.16);
+  border: 1px solid rgba(240, 168, 80, 0.5);
+  vertical-align: middle;
+}

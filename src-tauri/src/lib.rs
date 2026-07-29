@@ -939,6 +939,13 @@ async fn install_apk_devices(
     Ok(adb::commands::install_apk(devices, apk_path, Arc::clone(&state.adb_semaphore)).await)
 }
 
+// ── Leases (for the UI's "under automation" badge) ─────────────────────────────
+
+#[tauri::command]
+async fn get_leases(leases: State<'_, control_api::Leases>) -> Result<Vec<control_api::Lease>, String> {
+    Ok(leases.lock().unwrap().values().cloned().collect())
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1002,6 +1009,7 @@ pub fn run() {
         .manage(app_state)
         .manage(ws_hub)
         .manage(recording::new_recorders())
+        .manage(control_api::new_leases())
         .invoke_handler(tauri::generate_handler![
             add_server,
             remove_server,
@@ -1020,6 +1028,7 @@ pub fn run() {
             launch_scrcpy,
             run_shell_devices,
             install_apk_devices,
+            get_leases,
             load_config,
             refresh_devices,
         ])
@@ -1077,6 +1086,7 @@ pub fn run() {
                 control_api::token_file_display()
             );
             let recorders = app.state::<recording::Recorders>().inner().clone();
+            let leases = app.state::<control_api::Leases>().inner().clone();
             let control_state = control_api::ControlApiState::new(
                 Arc::clone(&state.servers),
                 Arc::clone(&state.adb_semaphore),
@@ -1084,6 +1094,7 @@ pub fn run() {
                 state.control_sockets.clone(),
                 api_token,
                 recorders,
+                leases,
                 app_handle.clone(),
             );
             tauri::async_runtime::spawn(async move {

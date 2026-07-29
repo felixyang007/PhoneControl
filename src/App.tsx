@@ -4,6 +4,7 @@ import { useStore } from './store';
 import { useDevices } from './hooks/useDevices';
 import { useStreamEvents } from './hooks/useStreamEvents';
 import { useStream } from './hooks/useStream';
+import { useLeases } from './hooks/useLeases';
 import { Sidebar } from './components/Sidebar/Sidebar';
 import { DeviceGrid } from './components/DeviceGrid/DeviceGrid';
 import { Toolbar } from './components/Toolbar/Toolbar';
@@ -16,6 +17,7 @@ export default function App() {
   useDevices();
   useStreamEvents();
   useStream();
+  useLeases();
 
   useEffect(() => {
     const timers: ReturnType<typeof setTimeout>[] = [];
