@@ -27,8 +27,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::process::Command as TokioCommand;
 
 use axum::{
     extract::{Query, Request, State},
@@ -43,6 +46,7 @@ use serde_json::{json, Value};
 use tauri::AppHandle;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::adb::binaries::adb as adb_bin;
 use crate::adb::stream::{start_stream_loop, StreamOptions};
 use crate::recording::Recorder;
 
@@ -107,7 +111,22 @@ pub struct Lease {
     pub expires_at: u64,
 }
 
-/// Shared handles the API borrows from `AppState`, plus its own lease registry.
+/// One device's artifacts from a smoke run (what `/smoke/report` returns).
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceArtifact {
+    pub serial: String,
+    pub mp4: Option<String>,
+    pub logcat: Option<String>,
+    pub frames: u64,
+}
+
+/// An in-flight capture's logcat side (the mp4 side lives in `Recorders`).
+struct ActiveCapture {
+    logcat_path: String,
+    logcat: Option<tokio::process::Child>,
+}
+
+/// Shared handles the API borrows from `AppState`, plus its own registries.
 #[derive(Clone)]
 pub struct ControlApiState {
     pub servers: Arc<Mutex<Vec<AdbServer>>>,
@@ -119,6 +138,10 @@ pub struct ControlApiState {
     pub token: String,
     /// Active recordings, keyed by serial (shared with the scrcpy receive loop).
     pub recorders: crate::recording::Recorders,
+    /// In-flight logcat captures, keyed by serial.
+    captures: Arc<StdMutex<HashMap<String, ActiveCapture>>>,
+    /// Finished artifacts accumulated per task_id, for `/smoke/report`.
+    reports: Arc<StdMutex<HashMap<String, Vec<DeviceArtifact>>>>,
     /// Needed to (re)start a video-only stream to feed the recorder.
     pub app: AppHandle,
 }
@@ -141,6 +164,8 @@ impl ControlApiState {
             leases: Arc::new(StdMutex::new(HashMap::new())),
             token,
             recorders,
+            captures: Arc::new(StdMutex::new(HashMap::new())),
+            reports: Arc::new(StdMutex::new(HashMap::new())),
             app,
         }
     }
@@ -486,14 +511,13 @@ async fn capture_start(
 
     let task_id = req.task_id.clone().unwrap_or_else(|| "adhoc".to_string());
 
-    // Output path: <dir>/<task>-<serial>-<epoch>.mp4 (serial sanitised).
+    // Paired artifact paths: <dir>/<task>-<serial>-<epoch>.{mp4,logcat.txt}.
     let dir = req.output_dir.map(PathBuf::from).unwrap_or_else(recordings_dir);
     let _ = std::fs::create_dir_all(&dir);
     let safe_serial = serial.replace([':', '/'], "_");
-    let path = dir
-        .join(format!("{task_id}-{safe_serial}-{}.mp4", now_secs()))
-        .display()
-        .to_string();
+    let stem = format!("{task_id}-{safe_serial}-{}", now_secs());
+    let mp4_path = dir.join(format!("{stem}.mp4")).display().to_string();
+    let logcat_path = dir.join(format!("{stem}.logcat.txt")).display().to_string();
 
     // Register the recorder. One per serial.
     {
@@ -501,8 +525,46 @@ async fn capture_start(
         if map.contains_key(&serial) {
             return Err((StatusCode::CONFLICT, format!("already recording {serial}")));
         }
-        map.insert(serial.clone(), Recorder::new(path.clone(), task_id.clone()));
+        map.insert(serial.clone(), Recorder::new(mp4_path.clone(), task_id.clone()));
     }
+
+    // Logcat capture (best-effort): clear the buffer so we only get this run's
+    // window, then stream `adb logcat` to a file until capture/stop kills it.
+    let prefix = server_args(&host, port);
+    let mut clear = prefix.clone();
+    clear.extend(["-s".into(), serial.clone(), "logcat".into(), "-c".into()]);
+    let _ = TokioCommand::new(adb_bin()).args(&clear).status().await;
+
+    let logcat_child = match std::fs::File::create(&logcat_path) {
+        Ok(f) => {
+            let mut args = prefix.clone();
+            args.extend([
+                "-s".into(),
+                serial.clone(),
+                "logcat".into(),
+                "-v".into(),
+                "threadtime".into(),
+            ]);
+            TokioCommand::new(adb_bin())
+                .args(&args)
+                .stdout(Stdio::from(f))
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| eprintln!("[CTRL-API] logcat spawn failed: {e}"))
+                .ok()
+        }
+        Err(e) => {
+            eprintln!("[CTRL-API] logcat file create failed: {e}");
+            None
+        }
+    };
+    st.captures.lock().unwrap().insert(
+        serial.clone(),
+        ActiveCapture {
+            logcat_path: logcat_path.clone(),
+            logcat: logcat_child,
+        },
+    );
 
     // (Re)start a video-only stream so frames flow to the recorder tap.
     tauri::async_runtime::spawn(start_stream_loop(
@@ -517,8 +579,13 @@ async fn capture_start(
         st.app.clone(),
     ));
 
-    println!("[CTRL-API] capture start serial={serial} task={task_id} → {path}");
-    Ok(Json(json!({ "task_id": task_id, "serial": serial, "output": path })))
+    println!("[CTRL-API] capture start serial={serial} task={task_id} → {mp4_path}");
+    Ok(Json(json!({
+        "task_id": task_id,
+        "serial": serial,
+        "output": mp4_path,
+        "logcat": logcat_path,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -557,6 +624,7 @@ async fn capture_stop(
         .unwrap()
         .remove(&serial)
         .ok_or((StatusCode::NOT_FOUND, format!("no recording for {serial}")))?;
+    let task_id = recorder.task_id.clone();
 
     // Stop the video-only stream we started for recording.
     stop_stream_loop(
@@ -570,19 +638,89 @@ async fn capture_stop(
     )
     .await;
 
-    let (path, frames) = recorder
+    let (mp4, frames) = recorder
         .finish()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    println!("[CTRL-API] capture stop serial={serial} frames={frames} → {path}");
-    Ok(Json(json!({ "serial": serial, "output": path, "frames": frames })))
+    // Stop logcat (remove from map first so we don't await while holding the lock).
+    let capture = st.captures.lock().unwrap().remove(&serial);
+    let logcat = match capture {
+        Some(mut cap) => {
+            if let Some(mut child) = cap.logcat.take() {
+                let _ = child.kill().await;
+            }
+            Some(cap.logcat_path)
+        }
+        None => None,
+    };
+
+    // Accumulate the artifact under its task for later `/smoke/report`.
+    let artifact = DeviceArtifact {
+        serial: serial.clone(),
+        mp4: Some(mp4.clone()),
+        logcat: logcat.clone(),
+        frames,
+    };
+    st.reports
+        .lock()
+        .unwrap()
+        .entry(task_id.clone())
+        .or_default()
+        .push(artifact.clone());
+
+    println!("[CTRL-API] capture stop serial={serial} task={task_id} frames={frames} → {mp4}");
+    Ok(Json(json!({
+        "serial": serial,
+        "task_id": task_id,
+        "output": mp4,
+        "logcat": logcat,
+        "frames": frames,
+    })))
 }
 
-// ── Phase 2 stub ──────────────────────────────────────────────────────────────
+// ── Report (artifact bundle) ──────────────────────────────────────────────────
 
-async fn report(Query(_q): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": "smoke/report (JUnit XML + JSON artifact bundle) — Phase 2, not implemented yet" })),
-    )
+/// `GET /api/v1/smoke/report?task_id=…` — the artifacts phone-control produced
+/// for a task (mp4 + logcat per device), plus a manifest.json written next to
+/// them. The pass/fail JUnit itself comes from Maestro; this bundles what the
+/// device side captured so CI can attach everything to one report/Linear bug.
+async fn report(
+    State(st): State<ControlApiState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let task_id = q
+        .get("task_id")
+        .cloned()
+        .ok_or((StatusCode::BAD_REQUEST, "task_id query param required".into()))?;
+
+    let artifacts = st
+        .reports
+        .lock()
+        .unwrap()
+        .get(&task_id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, format!("no artifacts for task {task_id}")))?;
+
+    let manifest = json!({ "task_id": task_id, "artifacts": artifacts });
+
+    // Write manifest.json next to the artifacts (dir of the first mp4).
+    let mut manifest_path = None;
+    if let Some(dir) = artifacts
+        .iter()
+        .find_map(|a| a.mp4.as_ref())
+        .and_then(|p| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
+    {
+        let path = dir.join(format!("{task_id}-manifest.json"));
+        if let Ok(text) = serde_json::to_string_pretty(&manifest) {
+            if std::fs::write(&path, text).is_ok() {
+                manifest_path = Some(path.display().to_string());
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "task_id": task_id,
+        "artifacts": artifacts,
+        "manifest": manifest_path,
+    })))
 }

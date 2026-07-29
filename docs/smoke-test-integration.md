@@ -83,7 +83,7 @@ Maestro 本身是个 CLI，直接通过 adb 跟设备通信，根本不需要 ph
 | POST | `/api/v1/install` | `adb install -r`（复用共享逻辑） | ✅ 骨架 |
 | POST | `/api/v1/capture/start` | 起 scrcpy 视频流录屏 → `.mp4`（decision #2） | ✅ |
 | POST | `/api/v1/capture/stop` | 停录并 finalize fast-start mp4，返回路径 + 帧数 | ✅ |
-| GET | `/api/v1/smoke/report` | JUnit/JSON 产物包 | ⏳ Phase 2（stub 501） |
+| GET | `/api/v1/smoke/report?task_id=` | 产物清单（mp4+logcat/设备）+ 写 manifest.json | ✅ |
 
 录屏 curl（接在装包之后、maestro 之前起，测完停）：
 ```bash
@@ -193,8 +193,8 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
   - scrcpy 流天然适配 Pure Rust muxer：首帧 header 带原始分辨率、包自带微秒 PTS、IDR 前固定带 SPS(0x67)/PPS(0x68)；muxer 负责 Annex B→AVCC、构 `avcC`/`moov`、`finish()` 时写 fast-start（CI/飞书/Linear 免下载在线预览）
   - ⚠️ **屏幕旋转坑**：竖→横切换时 scrcpy 重发新分辨率 + 新 SPS/PPS；MP4 不重编码无法中途改 track 分辨率。解法：监听分辨率变化 → `finish()` 当前段 → 新分辨率开 `part2.mp4`；报告按时序挂多段（需单文件再 CI 侧 ffmpeg 拼），比 Rust 端实时重编码高效得多
   - ❌ 不用 `adb screenrecord`（3min 限制 + 占存 + 多一次 pull I/O）
-- [ ] `adb logcat` per task 落盘到 `output-dir`；错误时 `adb exec-out screencap` 截图
-- [ ] `smoke/report`：产物打包为 JUnit XML + JSON 供 Jenkins 解析
+- [x] **`adb logcat` per task 落盘** —— `capture/start` 先 `logcat -c` 清缓冲再 `logcat -v threadtime` 落盘、`capture/stop` kill；与 mp4 成对（真机验证：434 行 threadtime 日志）。错误时 `adb exec-out screencap` 截图仍待做。
+- [x] **`smoke/report`** —— `GET /smoke/report?task_id=` 返回每设备产物（mp4+logcat+帧数）并写 `<task>-manifest.json`（真机验证通过）。JUnit pass/fail 由 Maestro 产出，本端只聚合设备侧产物。
 - [ ] 飞书/钉钉机器人推送（编排层）
 
 ### Phase 3 — AI 诊断与 Linear 联动（编排层，不进 App）
