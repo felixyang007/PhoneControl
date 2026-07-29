@@ -44,6 +44,28 @@ jstr() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 
 echo "▸ task=$TASK  api=$API  flow=$FLOW"
 
+# State the finalize trap reads. MAESTRO_RC starts at 1 so an interrupt before
+# the flow finishes counts as failure (blocks CI) rather than a false pass.
+CAPTURE_STARTED=0
+MAESTRO_RC=1
+
+# Exception safety: whatever happens after acquire — assertion failure, a
+# CI timeout SIGTERM, Ctrl-C — capture/stop, report, and release MUST run so
+# artifacts are finalised and the device is returned (not left for the TTL
+# sweeper). This trap is the single place steps 5/6/7 happen.
+finalize() {
+  trap - EXIT INT TERM
+  if [[ "$CAPTURE_STARTED" == "1" ]]; then
+    echo "▸ capture stop:"
+    api -X POST "$API/api/v1/capture/stop" -d "$(printf '{"serial":"%s"}' "$SERIAL")" || true; echo
+    echo "▸ report (exit_code=$MAESTRO_RC):"
+    api "$API/api/v1/smoke/report?task_id=$TASK&exit_code=$MAESTRO_RC" || true; echo
+  fi
+  api -X POST "$API/api/v1/devices/release" -d "$(printf '{"task_id":"%s"}' "$TASK")" >/dev/null 2>&1 || true
+  echo "▸ done · exit=$MAESTRO_RC"
+  exit "$MAESTRO_RC"
+}
+
 # 1) acquire a device (any idle, or the requested serial)
 if [[ -n "$SERIAL" ]]; then body=$(printf '{"task_id":"%s","serial":"%s"}' "$TASK" "$SERIAL")
 else                        body=$(printf '{"task_id":"%s"}' "$TASK"); fi
@@ -52,9 +74,8 @@ SERIAL=$(printf '%s' "$acq" | jstr serial)
 [[ -n "$SERIAL" ]] || die "acquire failed: $acq"
 echo "▸ acquired $SERIAL"
 
-# release on any exit (belt-and-braces; the TTL sweeper is the backstop)
-cleanup() { api -X POST "$API/api/v1/devices/release" -d "$(printf '{"task_id":"%s"}' "$TASK")" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+# Arm finalize only AFTER a successful acquire (nothing to clean up before it).
+trap finalize EXIT INT TERM
 
 # 2) install the APK (optional)
 if [[ -n "$APK" ]]; then
@@ -66,22 +87,17 @@ fi
 if [[ -n "$OUTPUT_DIR" ]]; then start=$(printf '{"task_id":"%s","serial":"%s","output_dir":"%s"}' "$TASK" "$SERIAL" "$OUTPUT_DIR")
 else                           start=$(printf '{"task_id":"%s","serial":"%s"}' "$TASK" "$SERIAL"); fi
 api -X POST "$API/api/v1/capture/start" -d "$start" >/dev/null
+CAPTURE_STARTED=1
 echo "▸ capture started"
 
-# 4) run the Maestro flow (phone-control does NOT drive the UI — decision #3)
-rc=0
+# 4) run the Maestro flow (phone-control does NOT drive the UI — decision #3).
+#    finalize (trap) runs on the way out — steps 5/6/7 happen there.
 if command -v maestro >/dev/null 2>&1; then
   echo "▸ maestro test --device $SERIAL $FLOW"
-  maestro test --device "$SERIAL" "$FLOW" || rc=$?
+  maestro test --device "$SERIAL" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
 else
   echo "▸ WARN: maestro not installed — UI flow SKIPPED."
   echo "        install: curl -Ls https://get.maestro.mobile.dev | bash"
-  rc=127
+  MAESTRO_RC=127
 fi
-
-# 5) stop capture + 6) fetch the artifact report (always, even on failure)
-echo "▸ capture stop:"; api -X POST "$API/api/v1/capture/stop" -d "$(printf '{"serial":"%s"}' "$SERIAL")"; echo
-echo "▸ report:";       api "$API/api/v1/smoke/report?task_id=$TASK"; echo
-
-echo "▸ maestro exit=$rc"
-exit "$rc"
+# fall through → EXIT trap → finalize()

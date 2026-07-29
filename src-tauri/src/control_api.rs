@@ -63,6 +63,59 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One quick `getprop` call for the manifest's device_info.
+async fn fetch_device_info(host: &str, port: u16, serial: &str) -> DeviceInfo {
+    let mut args = server_args(host, port);
+    args.extend([
+        "-s".into(),
+        serial.into(),
+        "shell".into(),
+        "getprop ro.product.model; getprop ro.build.version.release".into(),
+    ]);
+    let text = TokioCommand::new(adb_bin())
+        .args(&args)
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut lines = text.lines();
+    DeviceInfo {
+        model: lines.next().unwrap_or("").trim().to_string(),
+        os_version: lines.next().unwrap_or("").trim().to_string(),
+    }
+}
+
+/// Stop a child process gracefully: SIGTERM first so it flushes its buffers
+/// (for `adb logcat`, that last flush may hold the crash stacktrace), wait
+/// briefly, then SIGKILL only as a last resort.
+async fn terminate_gracefully(mut child: tokio::process::Child) {
+    match child.id() {
+        Some(pid) => {
+            // SIGTERM
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            if tokio::time::timeout(Duration::from_millis(1200), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await; // drain timed out — force it
+            }
+        }
+        None => {
+            let _ = child.kill().await;
+        }
+    }
+}
+
 fn token_file() -> PathBuf {
     let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push(".phone_control");
@@ -119,19 +172,30 @@ pub fn new_leases() -> Leases {
     Arc::new(StdMutex::new(HashMap::new()))
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub model: String,
+    pub os_version: String,
+}
+
 /// One device's artifacts from a smoke run (what `/smoke/report` returns).
+/// Field names are the stable contract the CI/AI orchestration layer reads.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceArtifact {
     pub serial: String,
-    pub mp4: Option<String>,
-    pub logcat: Option<String>,
-    pub frames: u64,
+    pub mp4_path: Option<String>,
+    pub logcat_path: Option<String>,
+    pub frame_count: u64,
+    pub duration_ms: u64,
+    pub device_info: DeviceInfo,
 }
 
 /// An in-flight capture's logcat side (the mp4 side lives in `Recorders`).
 struct ActiveCapture {
     logcat_path: String,
     logcat: Option<tokio::process::Child>,
+    started_ms: u64,
+    device_info: DeviceInfo,
 }
 
 /// Shared handles the API borrows from `AppState`, plus its own registries.
@@ -531,6 +595,9 @@ async fn capture_start(
         map.insert(serial.clone(), Recorder::new(mp4_path.clone(), task_id.clone()));
     }
 
+    let started_ms = now_ms();
+    let device_info = fetch_device_info(&host, port, &serial).await;
+
     // Logcat capture (best-effort): clear the buffer so we only get this run's
     // window, then stream `adb logcat` to a file until capture/stop kills it.
     let prefix = server_args(&host, port);
@@ -566,6 +633,8 @@ async fn capture_start(
         ActiveCapture {
             logcat_path: logcat_path.clone(),
             logcat: logcat_child,
+            started_ms,
+            device_info,
         },
     );
 
@@ -647,24 +716,35 @@ async fn capture_stop(
         .finish()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Stop logcat (remove from map first so we don't await while holding the lock).
+    // Stop logcat (remove from map first so we don't await while holding the
+    // lock). SIGTERM + drain, never SIGKILL — keep the last flushed lines.
     let capture = st.captures.lock().unwrap().remove(&serial);
-    let logcat = match capture {
+    let (logcat, duration_ms, device_info) = match capture {
         Some(mut cap) => {
-            if let Some(mut child) = cap.logcat.take() {
-                let _ = child.kill().await;
+            if let Some(child) = cap.logcat.take() {
+                terminate_gracefully(child).await;
             }
-            Some(cap.logcat_path)
+            (
+                Some(cap.logcat_path),
+                now_ms().saturating_sub(cap.started_ms),
+                cap.device_info,
+            )
         }
-        None => None,
+        None => (
+            None,
+            0,
+            DeviceInfo { model: String::new(), os_version: String::new() },
+        ),
     };
 
     // Accumulate the artifact under its task for later `/smoke/report`.
     let artifact = DeviceArtifact {
         serial: serial.clone(),
-        mp4: Some(mp4.clone()),
-        logcat: logcat.clone(),
-        frames,
+        mp4_path: Some(mp4.clone()),
+        logcat_path: logcat.clone(),
+        frame_count: frames,
+        duration_ms,
+        device_info,
     };
     st.reports
         .lock()
@@ -673,22 +753,19 @@ async fn capture_stop(
         .or_default()
         .push(artifact.clone());
 
-    println!("[CTRL-API] capture stop serial={serial} task={task_id} frames={frames} → {mp4}");
-    Ok(Json(json!({
-        "serial": serial,
-        "task_id": task_id,
-        "output": mp4,
-        "logcat": logcat,
-        "frames": frames,
-    })))
+    println!(
+        "[CTRL-API] capture stop serial={serial} task={task_id} frames={frames} dur={duration_ms}ms → {mp4}"
+    );
+    Ok(Json(json!(artifact)))
 }
 
 // ── Report (artifact bundle) ──────────────────────────────────────────────────
 
-/// `GET /api/v1/smoke/report?task_id=…` — the artifacts phone-control produced
-/// for a task (mp4 + logcat per device), plus a manifest.json written next to
-/// them. The pass/fail JUnit itself comes from Maestro; this bundles what the
-/// device side captured so CI can attach everything to one report/Linear bug.
+/// `GET /api/v1/smoke/report?task_id=…&exit_code=…` — the standardized
+/// `<task>-manifest.json` bundle: per-device artifacts (mp4/logcat/frames/
+/// duration/device_info) plus the caller-supplied `exit_code` (Maestro's
+/// result, which phone-control can't know itself). This JSON is the single
+/// bridge the CI/AI orchestration layer reads — it needs no other context.
 async fn report(
     State(st): State<ControlApiState>,
     Query(q): Query<HashMap<String, String>>,
@@ -697,6 +774,8 @@ async fn report(
         .get("task_id")
         .cloned()
         .ok_or((StatusCode::BAD_REQUEST, "task_id query param required".into()))?;
+    // exit_code is injected by the caller (smoke-run.sh knows Maestro's result).
+    let exit_code: Option<i64> = q.get("exit_code").and_then(|s| s.parse().ok());
 
     let artifacts = st
         .reports
@@ -706,13 +785,17 @@ async fn report(
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, format!("no artifacts for task {task_id}")))?;
 
-    let manifest = json!({ "task_id": task_id, "artifacts": artifacts });
+    let manifest = json!({
+        "task_id": task_id,
+        "exit_code": exit_code,
+        "artifacts": artifacts,
+    });
 
     // Write manifest.json next to the artifacts (dir of the first mp4).
     let mut manifest_path = None;
     if let Some(dir) = artifacts
         .iter()
-        .find_map(|a| a.mp4.as_ref())
+        .find_map(|a| a.mp4_path.as_ref())
         .and_then(|p| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
     {
         let path = dir.join(format!("{task_id}-manifest.json"));
@@ -723,9 +806,7 @@ async fn report(
         }
     }
 
-    Ok(Json(json!({
-        "task_id": task_id,
-        "artifacts": artifacts,
-        "manifest": manifest_path,
-    })))
+    let mut out = manifest;
+    out["manifest"] = json!(manifest_path);
+    Ok(Json(out))
 }

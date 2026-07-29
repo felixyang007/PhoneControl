@@ -2896,6 +2896,7 @@ dependencies = [
  "futures-util",
  "fxhash",
  "image",
+ "libc",
  "muxide",
  "serde",
  "serde_json",

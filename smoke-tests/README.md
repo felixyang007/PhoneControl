@@ -31,3 +31,29 @@ capture (mp4 + logcat); **Maestro** drives the UI. The orchestrator glues them.
 sh 'smoke-tests/smoke-run.sh --flow smoke-tests/app-smoke.yaml --apk app-debug.apk --task ${BUILD_TAG} --output-dir ${WORKSPACE}/artifacts'
 // artifacts/<task>-manifest.json lists the mp4 + logcat to archive / attach to Linear
 ```
+
+`smoke-run.sh` is exception-safe: a Maestro failure, a CI SIGTERM, or Ctrl-C all
+still run capture/stop + report + release (via a `trap`), so artifacts are always
+finalized and the device returned — not left for the 15-min TTL sweeper. The
+script exits with Maestro's code, so CI passes/fails on the flow.
+
+### `<task>-manifest.json` — the bridge to the orchestration/AI layer
+The single JSON the AI-triage step reads; every path it needs is in here.
+```json
+{
+  "task_id": "BUILD-1024",
+  "exit_code": 1,                       // Maestro's result, injected by smoke-run.sh
+  "artifacts": [                        // array: one entry per device (parallel-safe)
+    {
+      "serial": "emulator-5556",
+      "mp4_path": "/…/BUILD-1024-emulator-5556-<ts>.mp4",
+      "logcat_path": "/…/BUILD-1024-emulator-5556-<ts>.logcat.txt",
+      "frame_count": 55,
+      "duration_ms": 28787,
+      "device_info": { "model": "Pixel 6", "os_version": "13" }
+    }
+  ]
+}
+```
+Logcat is closed with SIGTERM (not SIGKILL), so the last flushed lines — often the
+crash stacktrace — are preserved.
