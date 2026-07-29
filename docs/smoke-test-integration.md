@@ -174,10 +174,15 @@ LaunchAgent 示例 `~/Library/LaunchAgents/com.mac.phone-control.plist`（**用�
 > ⚠️ 现实修正：原方案把「API 化 + iOS 冒烟」都压进 1~2 周。**iOS 是独立大头**（另一套 tidevice/simctl 工具链），Phase 1 只做 Android，iOS 单独排期。
 
 ### Phase 2 — 采集与产物聚合
-- [ ] **录屏（决策 #2）：scrcpy 纯视频流（video-only）→ Mac 本地 muxer 落盘 `.mp4`**
+- [ ] **录屏（决策 #2）：scrcpy 纯视频流（video-only）→ Pure Rust muxer 落盘 `.mp4`**
   - 租约模式下 phone-control 断开 control socket、以 `control=false` 重连拿视频流
-  - 侧读 H.264 NAL → Rust muxer（`mp4` crate 或封装 ffmpeg）写盘
-  - 收益：无时长限制、不占手机存储、对手机 CPU 无二次开销
+  - 侧读 H.264 NAL → **Pure Rust muxer（`muxide` 或 `mp4e`）** 写盘
+  - **muxer 选型：坚决用 Pure Rust，放弃 FFmpeg**
+    - ✅ Pure Rust：零外部依赖（编进单文件）、`cargo build` 一键出包、增量 <1MB、无 IPC 开销（在 scrcpy 接收 Loop 里顺手落盘）、内存安全无 C-FFI 崩溃/僵尸进程
+    - ❌ FFmpeg FFI（`ffmpeg-next`/`ac-ffmpeg`）：Universal Binary 交叉编译易断裂，C crash 直接砸崩 Tauri
+    - ❌ FFmpeg CLI sidecar：+70MB 打包、Pipe 二次拷贝、强杀遗留僵尸进程；仅作开发期调试备选
+  - scrcpy 流天然适配 Pure Rust muxer：首帧 header 带原始分辨率、包自带微秒 PTS、IDR 前固定带 SPS(0x67)/PPS(0x68)；muxer 负责 Annex B→AVCC、构 `avcC`/`moov`、`finish()` 时写 fast-start（CI/飞书/Linear 免下载在线预览）
+  - ⚠️ **屏幕旋转坑**：竖→横切换时 scrcpy 重发新分辨率 + 新 SPS/PPS；MP4 不重编码无法中途改 track 分辨率。解法：监听分辨率变化 → `finish()` 当前段 → 新分辨率开 `part2.mp4`；报告按时序挂多段（需单文件再 CI 侧 ffmpeg 拼），比 Rust 端实时重编码高效得多
   - ❌ 不用 `adb screenrecord`（3min 限制 + 占存 + 多一次 pull I/O）
 - [ ] `adb logcat` per task 落盘到 `output-dir`；错误时 `adb exec-out screencap` 截图
 - [ ] `smoke/report`：产物打包为 JUnit XML + JSON 供 Jenkins 解析
