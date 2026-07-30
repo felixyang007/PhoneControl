@@ -16,6 +16,10 @@
 #      ~/.phone_control/api_token (or $PHONE_CONTROL_TOKEN).
 set -uo pipefail
 
+# Maestro installs to ~/.maestro/bin, which a non-login shell (or a terminal
+# opened before install) won't have on PATH. Add it if maestro isn't found.
+command -v maestro >/dev/null 2>&1 || PATH="$PATH:$HOME/.maestro/bin"
+
 API="${SMOKE_API:-http://127.0.0.1:9090}"
 TOKEN="${PHONE_CONTROL_TOKEN:-$(cat "$HOME/.phone_control/api_token" 2>/dev/null || true)}"
 TASK="smoke-$$-$(date +%s)"
