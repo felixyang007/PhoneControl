@@ -105,3 +105,5 @@ New Item → **Pipeline** → Pipeline → **Pipeline script from SCM**：
 | `maestro: command not found` | 同上，PATH 里加 `~/.maestro/bin` |
 | 构建被 abort 后设备没释放 | Jenkins abort 发 SIGTERM，`smoke-run.sh` 的 trap 会 release；`kill -9` 才会漏，靠 15min TTL sweeper 兜底 |
 | 多 Job 抢同一台设备 | `disableConcurrentBuilds` + `/devices/acquire` 租约（`leased_by` 可查）已防抢 |
+| 401 / token 对不上 | token 文件路径是**下划线** `~/.phone_control/api_token`，不是连字符 `~/.phone-control/`。启动日志 `[CTRL-API] bearer token at <path>` 会打全路径，照它准 |
+| 改了 token 文件却不生效 | token **启动时读一次**；改文件后要重启 phone-control。且 **env `PHONE_CONTROL_TOKEN` 优先级高于文件**——设了 env（如 plist 里），就以 env 为准，文件被忽略。不想踩就别设 env，脚本统一 `TOKEN=$(cat ~/.phone_control/api_token)` |
