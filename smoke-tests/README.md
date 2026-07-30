@@ -41,7 +41,7 @@ In Jenkins these come from a `usernamePassword` credential (`plaud-qa-login`) �
 ## Jenkins
 Ready-to-use pipeline: [`Jenkinsfile`](Jenkinsfile). Full node/agent setup (the
 GUI-context/LaunchAgent requirement, TCC, credentials, job creation):
-[`../docs/jenkins-setup.md`](../docs/jenkins-setup.md).
+[`../docs/jenkins-setup.md`](../docs/jenkins-setup.md). 本地跑（不经 Jenkins）见 [`../docs/local-smoke-run.md`](../docs/local-smoke-run.md).
 
 Minimal shell if you'd rather script it yourself:
 ```bash
