@@ -395,25 +395,40 @@ async fn acquire_devices(
     Json(req): Json<AcquireReq>,
 ) -> Result<Json<AcquireResp>, (StatusCode, String)> {
     let available = online_devices(&st.servers).await;
-    let leased: std::collections::HashSet<String> =
-        { st.leases.lock().unwrap().keys().cloned().collect() };
+    let ttl = req.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
 
-    let chosen: DeviceRef = match &req.serial {
-        // `serial` filter — exact device.
-        Some(serial) => {
-            if leased.contains(serial) {
-                return Err((StatusCode::CONFLICT, format!("device {serial} already leased")));
+    // Pick an idle device AND record its lease under a single lock hold, so two
+    // simultaneous acquires can't both grab the same device (the check and the
+    // insert must be atomic — a gap here is the classic TOCTOU race that made
+    // parallel runs need staggered start times).
+    let lease = {
+        let mut map = st.leases.lock().unwrap();
+        let chosen: DeviceRef = match &req.serial {
+            // `serial` filter — exact device.
+            Some(serial) => {
+                if map.contains_key(serial) {
+                    return Err((StatusCode::CONFLICT, format!("device {serial} already leased")));
+                }
+                available
+                    .into_iter()
+                    .find(|d| &d.serial == serial)
+                    .ok_or((StatusCode::CONFLICT, format!("device {serial} not online")))?
             }
-            available
+            // `any` filter — first device not already leased (checked live).
+            None => available
                 .into_iter()
-                .find(|d| &d.serial == serial)
-                .ok_or((StatusCode::CONFLICT, format!("device {serial} not online")))?
-        }
-        // `any` filter — first idle device.
-        None => available
-            .into_iter()
-            .find(|d| !leased.contains(&d.serial))
-            .ok_or((StatusCode::CONFLICT, "no idle device available".to_string()))?,
+                .find(|d| !map.contains_key(&d.serial))
+                .ok_or((StatusCode::CONFLICT, "no idle device available".to_string()))?,
+        };
+        let lease = Lease {
+            serial: chosen.serial.clone(),
+            server_host: chosen.server_host,
+            server_port: chosen.server_port,
+            task_id: req.task_id.clone(),
+            expires_at: now_secs() + ttl,
+        };
+        map.insert(lease.serial.clone(), lease.clone());
+        lease
     };
 
     // Decision #3 (refined): release only the *control* socket so phone-control
@@ -421,20 +436,7 @@ async fn acquire_devices(
     // running so an operator can watch the automation live in the UI. A
     // read-only H.264 mirror doesn't contend with Maestro's UiAutomator input
     // channel (proven: recording streams video the whole time Maestro runs).
-    st.control_sockets.lock().unwrap().remove(&chosen.serial);
-
-    let ttl = req.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
-    let lease = Lease {
-        serial: chosen.serial.clone(),
-        server_host: chosen.server_host,
-        server_port: chosen.server_port,
-        task_id: req.task_id.clone(),
-        expires_at: now_secs() + ttl,
-    };
-    st.leases
-        .lock()
-        .unwrap()
-        .insert(chosen.serial.clone(), lease.clone());
+    st.control_sockets.lock().unwrap().remove(&lease.serial);
 
     Ok(Json(AcquireResp {
         task_id: req.task_id,
