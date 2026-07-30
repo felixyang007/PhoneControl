@@ -7,8 +7,19 @@ Role split (decision #3): **phone-control** does device scheduling + install +
 capture (mp4 + logcat); **Maestro** drives the UI. The orchestrator glues them.
 
 ## Files
-- `settings-smoke.yaml` — runnable-anywhere demo flow (targets `com.android.settings`); use it to validate the pipeline without the product APK.
+- `settings-smoke.yaml` — runnable-anywhere demo flow (targets `com.android.settings`); use it to validate the pipeline without the product APK or creds.
+- `plaud-smoke.yaml` — the real Plaud P0 flow (login → Ask Plaud). **Creds are not hardcoded** — pass them at run time (see below), so no secret is committed.
 - `app-smoke.template.yaml` — P0 template for the product app; copy, fill TODOs, pass `--env APP_ID=...`.
+
+### Credentials (never commit them)
+`plaud-smoke.yaml` uses `${LOGIN_USER}` / `${LOGIN_PASS}`. Inject at run time:
+```bash
+smoke-tests/smoke-run.sh --flow smoke-tests/plaud-smoke.yaml \
+  --uninstall ai.plaud.android.plaud --apk ./app-debug.apk \
+  --maestro-env "LOGIN_USER=…" --maestro-env "LOGIN_PASS=…" \
+  --serial emulator-5556 --output-dir /tmp/art --junit /tmp/art/junit.xml
+```
+In Jenkins these come from a `usernamePassword` credential (`plaud-qa-login`) — see `Jenkinsfile`.
 - `smoke-run.sh` — orchestrator: acquire → [install] → capture/start → `maestro test` → capture/stop → report → release. Exit code is Maestro's. `--triage` runs AI root-cause on failure; `--triage-create` also files a Linear bug.
 - `smoke-triage.sh` + `triage-prompt.md` — Phase 3: on a failed run, extract crash/network signals from the logcat and ask Claude to classify (A crash / B env / C flaky-UI); with `--create`, file a Linear bug (class [A] only) via the Linear MCP. Runs in CI, not in the app.
 

@@ -20,6 +20,7 @@ API="${SMOKE_API:-http://127.0.0.1:9090}"
 TOKEN="${PHONE_CONTROL_TOKEN:-$(cat "$HOME/.phone_control/api_token" 2>/dev/null || true)}"
 TASK="smoke-$$-$(date +%s)"
 FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE="" ; JUNIT="" ; UNINSTALL=""
+MENV=()   # `maestro --env K=V` passthrough (e.g. login creds — never hardcode them)
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --task)          TASK="$2"; shift 2;;
     --output-dir)    OUTPUT_DIR="$2"; shift 2;;
     --junit)         JUNIT="$2"; shift 2;;       # write Maestro JUnit XML here
+    --maestro-env)   MENV+=(--env "$2"); shift 2;;  # forwarded to `maestro test` (repeatable)
     --api)           API="$2"; shift 2;;
     --triage)        TRIAGE="dry-run"; shift;;   # AI root-cause on failure
     --triage-create) TRIAGE="create"; shift;;    # …and file a Linear bug
@@ -115,11 +117,12 @@ echo "▸ capture started"
 # 4) run the Maestro flow (phone-control does NOT drive the UI — decision #3).
 #    finalize (trap) runs on the way out — steps 5/6/7 happen there.
 run_maestro() {  # $1 = log file to capture output for the retry check
+  # ${MENV[@]+...} is the bash 3.2-safe way to expand a possibly-empty array under set -u.
   if [[ -n "$JUNIT" ]]; then
     # JUnit XML for Jenkins' `junit` step to parse into pass/fail.
-    maestro test --device "$SERIAL" --format junit --output "$JUNIT" "$FLOW" 2>&1 | tee "$1"
+    maestro test --device "$SERIAL" --format junit --output "$JUNIT" ${MENV[@]+"${MENV[@]}"} "$FLOW" 2>&1 | tee "$1"
   else
-    maestro test --device "$SERIAL" "$FLOW" 2>&1 | tee "$1"
+    maestro test --device "$SERIAL" ${MENV[@]+"${MENV[@]}"} "$FLOW" 2>&1 | tee "$1"
   fi
   return "${PIPESTATUS[0]}"
 }

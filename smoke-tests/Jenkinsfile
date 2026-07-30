@@ -9,8 +9,8 @@ pipeline {
   agent { label 'mac-device-lab' }
 
   parameters {
-    string(name: 'FLOW', defaultValue: 'smoke-tests/settings-smoke.yaml',
-           description: 'Maestro flow to run')
+    string(name: 'FLOW', defaultValue: 'smoke-tests/plaud-smoke.yaml',
+           description: 'Maestro flow to run (settings-smoke.yaml is the no-creds demo)')
     string(name: 'APK_PATH', defaultValue: '',
            description: 'APK to install first (empty = test whatever is installed). A path on the agent, or use a Copy-Artifact step upstream.')
     string(name: 'DEVICE_SERIAL', defaultValue: '',
@@ -53,22 +53,29 @@ pipeline {
     }
 
     stage('Smoke') {
+      // Login creds come from a Jenkins username/password credential (id
+      // 'plaud-qa-login') and are injected into the flow via Maestro --env,
+      // so no secret lives in git. Clean-install uninstalls the app first.
       steps {
-        sh '''
-          set -e
-          serialArg=""; [ -n "$DEVICE_SERIAL" ] && serialArg="--serial $DEVICE_SERIAL"
-          apkArg="";     [ -n "$APK_PATH" ]     && apkArg="--apk $APK_PATH"
-          triageArg="--triage"; [ "$FILE_LINEAR" = "true" ] && triageArg="--triage-create"
+        withCredentials([usernamePassword(credentialsId: 'plaud-qa-login',
+                          usernameVariable: 'LOGIN_USER', passwordVariable: 'LOGIN_PASS')]) {
+          sh '''
+            set -e
+            serialArg="";  [ -n "$DEVICE_SERIAL" ] && serialArg="--serial $DEVICE_SERIAL"
+            apkArg="";      [ -n "$APK_PATH" ]     && apkArg="--apk $APK_PATH --uninstall ai.plaud.android.plaud"
+            triageArg="--triage"; [ "$FILE_LINEAR" = "true" ] && triageArg="--triage-create"
+            envArgs=""
+            [ -n "$LOGIN_USER" ] && envArgs="--maestro-env LOGIN_USER=$LOGIN_USER --maestro-env LOGIN_PASS=$LOGIN_PASS"
 
-          # Token is read from ~/.phone_control/api_token by smoke-run.sh.
-          # (Or inject a Jenkins credential as PHONE_CONTROL_TOKEN.)
-          smoke-tests/smoke-run.sh \
-            --flow "$FLOW" $serialArg $apkArg \
-            --task "$TASK" \
-            --output-dir "$ARTIFACTS" \
-            --junit "$ARTIFACTS/junit.xml" \
-            $triageArg
-        '''
+            # Token is read from ~/.phone_control/api_token by smoke-run.sh.
+            smoke-tests/smoke-run.sh \
+              --flow "$FLOW" $serialArg $apkArg $envArgs \
+              --task "$TASK" \
+              --output-dir "$ARTIFACTS" \
+              --junit "$ARTIFACTS/junit.xml" \
+              $triageArg
+          '''
+        }
       }
     }
   }

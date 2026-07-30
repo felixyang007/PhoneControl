@@ -1,0 +1,35 @@
+# Plaud app P0 smoke: cold start → email login → Ask Plaud → send a query.
+# Credentials are NOT hardcoded — pass them at run time so no secret lands in git:
+#   maestro test --env LOGIN_USER=... --env LOGIN_PASS=... plaud-smoke.yaml
+# (smoke-run.sh forwards them via --maestro-env "LOGIN_USER=..." etc.)
+appId: ai.plaud.android.plaud
+---
+- launchApp:
+    clearState: true
+- tapOn: "Continue with email"
+- tapOn:
+    point: 10%,26%
+- inputText: "${LOGIN_USER}"
+- tapOn: "Password"
+- inputText: "${LOGIN_PASS}"
+- hideKeyboard
+- tapOn: "Sign in"
+- tapOn: "Enable"
+- tapOn: "Sync to cloud"
+- back
+- tapOn: "Ask Plaud"
+- tapOn: "Text input"
+- tapOn: "Describe a task, or ask Plaud anything"
+- inputText: "深圳今天天气"
+- hideKeyboard
+- tapOn:
+    point: 88%,92%          # send (↑) button — icon, no text, so tap by point
+# Bounded wait for Ask Plaud's answer to render (the Like button appears under a
+# finished answer). This is the smoke signal; capped at 45s so a slow/absent
+# answer fails fast instead of Maestro retrying for ~20min. Tune the timeout to
+# your backend's real latency. (Add `- tapOn: "Like"` after if you want to test
+# the like action itself.)
+- extendedWaitUntil:
+    visible: "Like"
+    timeout: 45000
+- takeScreenshot: "ask plaud"
