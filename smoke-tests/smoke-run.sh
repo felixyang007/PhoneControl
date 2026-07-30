@@ -19,13 +19,14 @@ set -uo pipefail
 API="${SMOKE_API:-http://127.0.0.1:9090}"
 TOKEN="${PHONE_CONTROL_TOKEN:-$(cat "$HOME/.phone_control/api_token" 2>/dev/null || true)}"
 TASK="smoke-$$-$(date +%s)"
-FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE="" ; JUNIT=""
+FLOW="" ; APK="" ; SERIAL="" ; OUTPUT_DIR="" ; TRIAGE="" ; JUNIT="" ; UNINSTALL=""
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --flow)          FLOW="$2"; shift 2;;
     --apk)           APK="$2"; shift 2;;
+    --uninstall)     UNINSTALL="$2"; shift 2;;   # adb uninstall <pkg> before install (clean install)
     --serial)        SERIAL="$2"; shift 2;;
     --task)          TASK="$2"; shift 2;;
     --output-dir)    OUTPUT_DIR="$2"; shift 2;;
@@ -91,6 +92,13 @@ echo "▸ acquired $SERIAL"
 # Arm finalize only AFTER a successful acquire (nothing to clean up before it).
 trap finalize EXIT INT TERM
 
+# 1b) clean install: uninstall the old package first (avoids signature mismatch
+#     on debug rebuilds). Direct adb; ignore "not installed".
+if [[ -n "$UNINSTALL" ]]; then
+  echo "▸ uninstall $UNINSTALL"
+  adb -s "$SERIAL" uninstall "$UNINSTALL" || true
+fi
+
 # 2) install the APK (optional)
 if [[ -n "$APK" ]]; then
   echo "▸ installing $APK"
@@ -106,14 +114,31 @@ echo "▸ capture started"
 
 # 4) run the Maestro flow (phone-control does NOT drive the UI — decision #3).
 #    finalize (trap) runs on the way out — steps 5/6/7 happen there.
-if command -v maestro >/dev/null 2>&1; then
-  echo "▸ maestro test --device $SERIAL $FLOW"
+run_maestro() {  # $1 = log file to capture output for the retry check
   if [[ -n "$JUNIT" ]]; then
     # JUnit XML for Jenkins' `junit` step to parse into pass/fail.
-    maestro test --device "$SERIAL" --format junit --output "$JUNIT" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
+    maestro test --device "$SERIAL" --format junit --output "$JUNIT" "$FLOW" 2>&1 | tee "$1"
   else
-    maestro test --device "$SERIAL" "$FLOW" && MAESTRO_RC=0 || MAESTRO_RC=$?
+    maestro test --device "$SERIAL" "$FLOW" 2>&1 | tee "$1"
   fi
+  return "${PIPESTATUS[0]}"
+}
+
+if command -v maestro >/dev/null 2>&1; then
+  mlog=$(mktemp 2>/dev/null || echo "/tmp/maestro-$TASK.log")
+  echo "▸ maestro test --device $SERIAL $FLOW"
+  run_maestro "$mlog"; MAESTRO_RC=$?
+  # Retry once if Maestro's on-device server died — a flaky adb port-forward
+  # (DeviceServerDiedException), NOT a flow failure. Restart adb and rerun.
+  # (The in-flight recording may be partial across the adb bounce; the flow
+  #  result + junit are what matter on this recovery path.)
+  if [[ "$MAESTRO_RC" != "0" ]] && grep -qiE "DeviceServerDied|Device server died" "$mlog"; then
+    echo "▸ Maestro device-server died (flaky adb) — restarting adb + retrying once…"
+    adb kill-server >/dev/null 2>&1 || true; sleep 1
+    adb start-server >/dev/null 2>&1 || true; adb wait-for-device || true; sleep 2
+    run_maestro "$mlog"; MAESTRO_RC=$?
+  fi
+  rm -f "$mlog"
 else
   echo "▸ WARN: maestro not installed — UI flow SKIPPED."
   echo "        install: curl -Ls https://get.maestro.mobile.dev | bash"
