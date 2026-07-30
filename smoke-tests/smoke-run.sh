@@ -136,13 +136,15 @@ if command -v maestro >/dev/null 2>&1; then
   echo "▸ maestro test --device $SERIAL $FLOW"
   run_maestro "$mlog"; MAESTRO_RC=$?
   # Retry once if Maestro's on-device server died — a flaky adb port-forward
-  # (DeviceServerDiedException), NOT a flow failure. Restart adb and rerun.
-  # (The in-flight recording may be partial across the adb bounce; the flow
-  #  result + junit are what matter on this recovery path.)
+  # (DeviceServerDiedException), NOT a flow failure. Reconnect just THIS device
+  # (not `adb kill-server`, which is global and would break other concurrent
+  # smoke-runs). If a bad adb server ever survives this, `adb kill-server`
+  # manually. (The in-flight recording may be partial across the bounce; the
+  # flow result + junit are what matter on this recovery path.)
   if [[ "$MAESTRO_RC" != "0" ]] && grep -qiE "DeviceServerDied|Device server died" "$mlog"; then
-    echo "▸ Maestro device-server died (flaky adb) — restarting adb + retrying once…"
-    adb kill-server >/dev/null 2>&1 || true; sleep 1
-    adb start-server >/dev/null 2>&1 || true; adb wait-for-device || true; sleep 2
+    echo "▸ Maestro device-server died (flaky adb) — reconnecting $SERIAL + retrying once…"
+    adb -s "$SERIAL" reconnect >/dev/null 2>&1 || true
+    adb -s "$SERIAL" wait-for-device || true; sleep 2
     run_maestro "$mlog"; MAESTRO_RC=$?
   fi
   rm -f "$mlog"
